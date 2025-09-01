@@ -1,0 +1,56 @@
+name: swing-alerts
+
+on:
+  schedule:
+    # After U.S. market close (UTC)
+    - cron: "30 20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test alert now"
+        type: boolean
+        default: false
+        required: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: swing-alerts-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy requests lxml beautifulsoup4
+
+      - name: Run alert scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WATCHLIST:           ${{ secrets.WATCHLIST }}
+          WATCHLIST_URL:       ${{ secrets.WATCHLIST_URL }}
+          # Universe mode (set USE_UNIVERSE=true to scan a whole index)
+          USE_UNIVERSE: "true"             # "false" to use WATCHLIST instead
+          UNIVERSE: "SP500"                # SP500 or NASDAQ100
+          YEARS: "2"
+          PRICE_MIN: "5"
+          PRICE_MAX: "20"
+          MIN_DOLLAR_VOL_M: "2.0"
+          SETUP_MODE: "Both"               # Both, Pullback, Breakout
+          # Plan params for suggested levels
+          ACCOUNT_SIZE: "10000"
+          RISK_PCT: "1.0"
+          STOP_ATR_MULT: "1.5"
+          TARGET_RR: "2.0"
+          ENTRY_STYLE: "Pullback to EMA20"
+          # Manual test toggle
+          TEST_ALERT: ${{ inputs.test_alert }}
+        run: python alerts.py
