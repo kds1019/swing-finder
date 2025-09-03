@@ -14,6 +14,9 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSkYP_WYicxul3vA__28bHE_HyTPGcr3fLgIeRo3Ki9DevytIYjm3REeB1AhNUDrtG2I4pNYmlO8ikf/pub?output=csv"
 WATCHLIST_URL = os.environ.get("WATCHLIST_URL", DEFAULT_SHEET_URL).strip()
 
+# Use extra columns from the sheet (Target/Stop/RSI_Low/VolSpike/Notes)
+USE_SHEET_LEVELS = os.environ.get("USE_SHEET_LEVELS", "true").lower() in ("1","true","yes","on")
+
 # Fallback list if the sheet can’t be read
 WATCHLIST = os.environ.get("WATCHLIST", "AAPL,MSFT,NVDA,TSLA,META")
 
@@ -75,7 +78,7 @@ def rsi(series, period=14):
     l = pd.Series(loss, index=series.index).ewm(alpha=1/period, adjust=False).mean()
     rs = g / l.replace(0, np.nan)
     out = 100 - (100 / (1 + rs))
-    return out.bfill()  # fix FutureWarning
+    return out.bfill()  # silence FutureWarning
 
 def macd(series, fast=12, slow=26, signal=9):
     fast_ = ema(series, fast); slow_ = ema(series, slow)
@@ -175,7 +178,6 @@ def load_watchlist_from_url(url: str) -> list[str]:
         tried.append(candidate)
         try:
             df = _read_csv_strict(candidate)
-            # Prefer a labeled column if present; otherwise use first column
             cols = [c for c in df.columns if str(c).strip().lower() in ("ticker","symbol")]
             series = df[cols[0]] if cols else df.iloc[:, 0]
             syms = [str(t).strip().upper() for t in series.tolist() if str(t).strip()]
@@ -184,8 +186,7 @@ def load_watchlist_from_url(url: str) -> list[str]:
                 return syms
             last_err = "No tickers found"
         except Exception as e:
-            last_err = str(e)
-            continue
+            last_err = str(e); continue
     print(f"[watchlist] failed to read CSV from URL. Last error: {last_err}\n"
           f"  Tried: {', '.join(tried)}\n"
           f"  Hints:\n"
@@ -195,12 +196,54 @@ def load_watchlist_from_url(url: str) -> list[str]:
           f"   • Remove any trailing spaces/newlines in the URL.")
     return []
 
+def _coerce_num(x):
+    try:
+        if pd.isna(x): return np.nan
+        return float(str(x).strip().replace("$","").replace(",",""))
+    except Exception:
+        return np.nan
+
+def load_watchlist_df(url: str):
+    """
+    Reads your published CSV and returns a normalized DataFrame with:
+      Ticker, Target, Stop, RSI_Low, VolSpike, Notes  (all optional except Ticker)
+
+    Works with headered or headerless sheets:
+      - If a Ticker/Symbol column exists, uses it; otherwise uses first column.
+      - Coerces numeric columns safely (empty -> NaN).
+    """
+    try:
+        tried = []
+        last_err = None
+        for candidate in _candidate_sheet_urls(url):
+            tried.append(candidate)
+            try:
+                df = _read_csv_strict(candidate)
+                df.columns = [str(c).strip() for c in df.columns]
+                ticker_col = next((c for c in df.columns if c.lower() in ("ticker","symbol")), df.columns[0])
+                out = pd.DataFrame({"Ticker": df[ticker_col]})
+                for col in ("Target","Stop","RSI_Low","VolSpike","Notes"):
+                    if col in df.columns: out[col] = df[col]
+                out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+                for col in ("Target","Stop","RSI_Low","VolSpike"):
+                    if col in out.columns: out[col] = out[col].apply(_coerce_num)
+                out = out[out["Ticker"].str.len() > 0]
+                if out.empty: 
+                    last_err = "No tickers found"; continue
+                print(f"[watchlist] Loaded {len(out)} rows with levels from Google Sheets.")
+                return out
+            except Exception as e:
+                last_err = str(e); continue
+        print(f"[watchlist] levels load failed: {last_err}\n  Tried: {', '.join(tried)}")
+        return None
+    except Exception as e:
+        print(f"[watchlist] levels load failed: {e}")
+        return None
+
 def get_watchlist() -> list[str]:
     if WATCHLIST_URL:
         wl = load_watchlist_from_url(WATCHLIST_URL)
-        if wl:
-            return wl
-    # fallback env WATCHLIST
+        if wl: return wl
     fallback = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
     print(f"[watchlist] Using fallback list ({len(fallback)}): {', '.join(fallback[:10])}...")
     return fallback
@@ -289,8 +332,64 @@ def format_alert(t: str, last: pd.Series, entry_style: str):
 
 def scan_watchlist_and_alert():
     msgs=[]
-    tickers = get_watchlist()
-    for t in tickers:
+    df_levels = load_watchlist_df(WATCHLIST_URL) if (WATCHLIST_URL and USE_SHEET_LEVELS) else None
+
+    if df_levels is not None and not df_levels.empty:
+        # Row-wise scan using thresholds from the sheet (if provided)
+        for _, row in df_levels.iterrows():
+            t = str(row["Ticker"]).upper()
+            try:
+                df = load_data(t, YEARS)
+                if df.empty:
+                    print(f"[skip] No data for {t} (Yahoo blocked? bad symbol? network?)")
+                    continue
+
+                df = build_indicators(df)
+                last = df.iloc[-1]
+                close = float(last["Close"])
+                rsi_v = float(last["RSI14"])
+                vol = float(last["Volume"])
+                adv20 = float(df["Volume"].rolling(20, min_periods=1).mean().iloc[-1])
+
+                hit_reasons = []
+
+                # Sheet-driven triggers (optional)
+                tgt = row.get("Target", np.nan)
+                stp = row.get("Stop",   np.nan)
+                rlo = row.get("RSI_Low", np.nan)
+                vsp = row.get("VolSpike", np.nan)
+
+                if np.isfinite(tgt) and close >= tgt:
+                    hit_reasons.append(f"🎯 Target {tgt:.2f} hit (last {close:.2f})")
+                if np.isfinite(stp) and close <= stp:
+                    hit_reasons.append(f"🛑 Stop {stp:.2f} hit (last {close:.2f})")
+                if np.isfinite(rlo) and rsi_v <= rlo:
+                    hit_reasons.append(f"📉 RSI {rsi_v:.1f} ≤ {rlo:.0f}")
+                if np.isfinite(vsp) and adv20 > 0 and vol >= vsp * adv20:
+                    hit_reasons.append(f"🔊 Vol spike {vol:,.0f} ≥ {vsp:.1f}× avg({adv20:,.0f})")
+
+                # Built-in crossover signals (unchanged)
+                if bool(last.get("buy_signal", False)):
+                    hit_reasons.append("➕ Bias BUY (EMA20>EMA50 & RSI>50 & Close>SMA50)")
+                if bool(last.get("sell_signal", False)):
+                    hit_reasons.append("➖ Bias SELL (EMA20<EMA50 & RSI<50 & Close<SMA50)")
+
+                if not hit_reasons:
+                    continue
+
+                base = format_alert(t, last, ENTRY_STYLE)
+                note = str(row.get("Notes","")).strip()
+                if note:
+                    base += f"\nNotes: {note}"
+                base += "\n" + "\n".join(f"- {r}" for r in hit_reasons)
+                msgs.append(base)
+
+            except Exception as e:
+                print(f"[warn] {t}: {e}")
+        return msgs
+
+    # Fallback: ticker-only behavior (original logic)
+    for t in get_watchlist():
         try:
             df = load_data(t, YEARS)
             if df.empty:
