@@ -973,8 +973,7 @@ def score_headlines_vader(headlines: list[dict]):
         return df, float(df["compound"].mean())
     return pd.DataFrame(columns=["title","link","published","compound","label"]), 0.0
 
-# ---------------- Sidebar ----------------
-# ---------------- Sidebar (with one-click presets) ----------------
+# ---------------- Sidebar (with one-click presets via callbacks) ----------------
 with st.sidebar:
     ticker    = st.text_input("Stock ticker (e.g., AAPL, MSFT, TSLA)", "AAPL", key="main_ticker_input")
     years     = st.slider("Years of history", 1, 10, 3, key="main_years_slider")
@@ -1033,19 +1032,30 @@ with st.sidebar:
     debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
     run_market_scan = st.button("Scan Market", key="btn_scan_market")
 
+    # -------- Presets (safe via on_click callbacks) --------
     st.markdown("---")
-    # -------- Presets --------
     st.subheader("Presets")
 
-    def _apply_preset(vals: dict):
+    def _apply_preset_cb(vals: dict):
+        # Coerce types to match widgets before setting
+        int_keys   = {"scan_max_symbols"}
+        float_keys = {"scan_price_min","scan_price_max","scan_min_dollar_vol",
+                      "scan_min_rs_slope","scan_min_vol_spike"}
         for k, v in vals.items():
+            if k in int_keys:
+                v = int(v)
+            elif k in float_keys:
+                v = float(v)
             st.session_state[k] = v
-        st.rerun()
+        # Automatic rerun occurs after button callback
 
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        if st.button("🔵 Breakout Momentum", use_container_width=True):
-            _apply_preset({
+        st.button(
+            "🔵 Breakout Momentum",
+            use_container_width=True,
+            on_click=_apply_preset_cb,
+            kwargs=dict(vals={
                 "scan_mode": "Breakout",
                 "scan_strictness": "Balanced",
                 "scan_only_today": True,
@@ -1053,14 +1063,18 @@ with st.sidebar:
                 "scan_price_max": 60.0,
                 "scan_min_dollar_vol": 2.0,
                 "scan_max_symbols": 150,
-                "scan_min_rs_slope": 1.0,     # ≥ +1.0 bp/day
-                "scan_min_vol_spike": 1.5,    # ≥ 1.5× RVOL
+                "scan_min_rs_slope": 1.0,   # ≥ +1.0 bp/day
+                "scan_min_vol_spike": 1.5,  # ≥ 1.5× RVOL
                 "scan_exclude_earn_days": 7,
                 "main_entry_style": "Breakout 20-day",
-            })
+            }),
+        )
     with col_p2:
-        if st.button("🟢 Pullback Uptrend", use_container_width=True):
-            _apply_preset({
+        st.button(
+            "🟢 Pullback Uptrend",
+            use_container_width=True,
+            on_click=_apply_preset_cb,
+            kwargs=dict(vals={
                 "scan_mode": "Pullback",
                 "scan_strictness": "Balanced",
                 "scan_only_today": False,
@@ -1072,12 +1086,16 @@ with st.sidebar:
                 "scan_min_vol_spike": 0.0,
                 "scan_exclude_earn_days": 5,
                 "main_entry_style": "Pullback to EMA20",
-            })
+            }),
+        )
 
     col_p3, col_p4 = st.columns(2)
     with col_p3:
-        if st.button("🟣 Post-Earnings Momentum", use_container_width=True):
-            _apply_preset({
+        st.button(
+            "🟣 Post-Earnings Momentum",
+            use_container_width=True,
+            on_click=_apply_preset_cb,
+            kwargs=dict(vals={
                 "scan_mode": "Both",
                 "scan_strictness": "Balanced",
                 "scan_only_today": True,
@@ -1089,10 +1107,14 @@ with st.sidebar:
                 "scan_min_vol_spike": 2.0,
                 "scan_exclude_earn_days": 0,   # allow earnings plays
                 "main_entry_style": "Breakout 20-day",
-            })
+            }),
+        )
     with col_p4:
-        if st.button("⚪ Baseline (relaxed)", use_container_width=True):
-            _apply_preset({
+        st.button(
+            "⚪ Baseline (relaxed)",
+            use_container_width=True,
+            on_click=_apply_preset_cb,
+            kwargs=dict(vals={
                 "scan_mode": "Both",
                 "scan_strictness": "Loose",
                 "scan_only_today": False,
@@ -1103,7 +1125,8 @@ with st.sidebar:
                 "scan_min_rs_slope": 0.0,
                 "scan_min_vol_spike": 0.0,
                 "scan_exclude_earn_days": 0,
-            })
+            }),
+        )
 
     st.markdown("---")
     if st.button("Force data refresh"):
@@ -1124,7 +1147,6 @@ with st.sidebar:
         if installed: st.caption("Installed: " + ", ".join(installed[:8]) + ("..." if len(installed)>8 else ""))
         if ollama_available(): st.success("Ollama detected.")
         else: st.info("Ollama not detected. Install from ollama.com, then: ollama pull llama3.2:1b")
-
 
 # ---------------- Top Buttons ----------------
 if st.button("Analyze", key="btn_analyze"):
@@ -1255,106 +1277,4 @@ if st.session_state.ran:
         ], axis=1).dropna()
         y = (df["Close"].shift(-1) > df["Close"]).astype(int)
         y = y.loc[X.index]
-        if len(X) > 200 and y.notna().sum() > 50:
-            Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.25,shuffle=False)
-            clf = RandomForestClassifier(n_estimators=300,max_depth=5,random_state=42,n_jobs=-1)
-            clf.fit(Xtr,ytr)
-            acc = accuracy_score(yte, clf.predict(Xte))
-            proba_up = float(clf.predict_proba(X.iloc[[-1]])[0,1])
-            imps = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False)
-            m1,m2,m3 = st.columns(3)
-            m1.metric("Prob. Up (next day)", f"{proba_up*100:.1f}%")
-            m2.metric("Backtest Accuracy*", f"{acc*100:.1f}%")
-            m3.metric("Top feature", imps.index[0])
-            with st.expander("Feature importances"):
-                st.write(imps.to_frame("importance"))
-            st.caption("*Toy model, simple split. Educational only.")
-        else:
-            st.info("Need more history for ML preview (200+ rows).")
-    except Exception as e:
-        st.warning(f"ML section error: {e}")
-
-    # -------- Seasonality & News Context --------
-    st.subheader("Seasonality & News Context (experimental)")
-    try:
-        # Seasonality
-        dow_tbl, mon_tbl = seasonality_tables(df)
-        csa, csb = st.columns(2)
-        with csa:
-            st.markdown("**Avg NEXT-day return by weekday**")
-            st.bar_chart(dow_tbl["avg_next_ret"]*100, use_container_width=True)
-            st.caption("Percent. Positive = on average, tomorrow leans up after that weekday.")
-        with csb:
-            st.markdown("**Avg NEXT-day return by month**")
-            st.bar_chart(mon_tbl["avg_next_ret"]*100, use_container_width=True)
-            this_mon = date.today().strftime("%b")
-            if this_mon in mon_tbl.index:
-                st.caption(f"Current month ({this_mon}) avg next-day: {mon_tbl.loc[this_mon,'avg_next_ret']*100:.2f}%")
-
-        # Earnings proximity banner
-        nxt_dt, dleft = get_upcoming_earnings(ticker)
-        if nxt_dt is not None and dleft is not None and dleft <= 14:
-            st.warning(f"Earnings in {dleft} day(s): {nxt_dt}. Consider reducing size or skipping swings.")
-
-        # Headlines + sentiment
-        news = fetch_rss_headlines(ticker, limit=10)
-        if news:
-            df_news, overall = score_headlines_vader(news)
-            colh1, colh2 = st.columns([2,1])
-            with colh1:
-                st.markdown("**Latest headlines**")
-                for _, r in df_news.iterrows():
-                    tag = "🟢" if r["label"]=="Bullish" else ("🔴" if r["label"]=="Bearish" else "⚪")
-                    st.markdown(f"{tag} [{r['title']}]({r['link']})  \n"
-                                f"<span style='opacity:0.7;font-size:0.85em'>{r['published']}</span>",
-                                unsafe_allow_html=True)
-            with colh2:
-                st.metric("Headline sentiment (avg)", f"{overall:+.2f}")
-                st.write(df_news["label"].value_counts())
-        else:
-            st.info("No headlines fetched (RSS may be blocked/limited).")
-    except Exception as e:
-        st.info(f"Seasonality/news module skipped: {e}")
-
-    # -------- Trade Plan --------
-    st.subheader("Trade Plan (educational)")
-    latest  = df.iloc[-1]
-    trend_up = latest["EMA20"] > latest["EMA50"]
-    atr_val = float(latest["ATR14"]); close = float(latest["Close"])
-    ema20   = float(latest["EMA20"]); ema50 = float(latest["EMA50"])
-    hh20    = float(latest.get("HH20", np.nan)); ll20 = float(latest.get("LL20", np.nan))
-    plan = plan_trade(latest, trend_up, atr_val, hh20, ll20, ema20, close,
-                      account_size, risk_pct, stop_atr_mult, target_rr, entry_style)
-
-    colA,colB,colC = st.columns(3)
-    colA.metric("Suggested Entry", f"{plan['entry']:,.2f}")
-    colB.metric("Stop", f"{plan['stop']:,.2f}")
-    colC.metric("Target", f"{plan['target']:,.2f}")
-
-    colD,colE,colF = st.columns(3)
-    colD.metric("Shares", f"{plan['shares']:,}")
-    colE.metric("Risk ($)", f"{plan['risk_dollars']:,.2f}")
-    colF.metric("Est. Reward ($)", f"{plan['reward_dollars']:,.2f}")
-
-    rr_val = plan.get("rr", float("nan"))
-    rr_str = f"{rr_val:.2f}" if (isinstance(rr_val, (int, float)) and np.isfinite(rr_val)) else "n/a"
-    st.caption(f"Method: {entry_style} | Stop {stop_atr_mult}x ATR | Target {target_rr}R (R = entry - stop). Approx R:R = {rr_str}")
-
-    ticket_text, json_bytes, csv_bytes, txt_bytes = make_order_ticket(
-        ticker=ticker, side_long=trend_up, entry_style=entry_style,
-        entry=plan['entry'], stop=plan['stop'], target=plan['target'], shares=plan['shares'],
-        rr=plan['rr'], atr_val=atr_val, risk_dollars=plan['risk_dollars'], reward_dollars=plan['reward_dollars']
-    )
-
-    st.subheader("Webull Order Ticket (copy/paste)")
-    st.code(ticket_text, language="text")
-    cdl1,cdl2,cdl3 = st.columns(3)
-    with cdl1: st.download_button("Download TXT",  data=txt_bytes,  file_name=f"{ticker.upper()}_ticket.txt",  mime="text/plain",        key="dl_txt")
-    with cdl2: st.download_button("Download JSON", data=json_bytes, file_name=f"{ticker.upper()}_ticket.json", mime="application/json",    key="dl_json")
-    with cdl3: st.download_button("Download CSV",  data=csv_bytes,  file_name=f"{ticker.upper()}_ticket.csv",  mime="text/csv",            key="dl_csv")
-
-    st.subheader("Plan explainer")
-    st.markdown(explain_plan(ticker, trend_up, entry_style, plan["entry"], plan["stop"], plan["target"],
-                             float(latest["RSI14"]), atr_val, ema20, ema50, hh20, ll20))
-else:
-    st.info("Type a ticker (e.g., AAPL) and press Analyze.")
+        if len(X) > 200 and y.notna().su
