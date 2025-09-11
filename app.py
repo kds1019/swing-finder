@@ -1,5 +1,5 @@
 # app.py
-# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news + optional local AI (Ollama)
+# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news
 # Run: streamlit run app.py
 # NOTE: Educational tool only. Not financial advice.
 
@@ -87,7 +87,7 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
             df[c] = pd.to_numeric(pd.Series(s).squeeze(), errors="coerce")
 
-    # Moving averages
+    # MAs
     df["SMA20"] = sma(df["Close"], 20)
     df["SMA50"] = sma(df["Close"], 50)
     df["EMA20"] = ema(df["Close"], 20)
@@ -465,7 +465,7 @@ def good_position_flags(last: pd.Series, prev: pd.Series, mode: str,
     ok = False; score = 0; reasons = []; fresh = False
 
     if mode in ("Pullback","Both") and in_pull:
-        is_fresh = pull_fresh or buy_trigger   # treat a cross day as fresh
+        is_fresh = pull_fresh or buy_trigger
         if (not only_today) or is_fresh:
             ok = True; fresh = fresh or is_fresh; score += 2
             reasons.append("pullback-window" + ("-fresh" if is_fresh else ""))
@@ -481,7 +481,7 @@ def good_position_flags(last: pd.Series, prev: pd.Series, mode: str,
 
     return ok, score, (None if not np.isfinite(band) else round(band,2)), (",".join(reasons) if reasons else "-"), fresh
 
-# -------- Quality filters: RS slope vs SPY --------
+# -------- Benchmark & RS slope --------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_benchmark(years: int = 3, symbol: str = "SPY") -> pd.DataFrame:
     return load_data(symbol, years)
@@ -512,7 +512,99 @@ def rs_slope_bps_per_day(df_sym: pd.DataFrame, df_bench: pd.DataFrame, lookback:
     except Exception:
         return 0.0
 
-# -------- Scanners (freshness + quality filters) --------
+# -------- Pro Score helpers --------
+def _lin_slope_bps(series: pd.Series, lookback: int = 20) -> float:
+    s = pd.Series(series).dropna().tail(lookback)
+    if len(s) < lookback: return np.nan
+    x = np.arange(len(s)).reshape(-1,1); y = s.values
+    lr = LinearRegression().fit(x, y)
+    last = float(s.iloc[-1]) if len(s) else np.nan
+    if not np.isfinite(last) or last == 0: return np.nan
+    return float(lr.coef_[0] / last * 10000.0)  # basis points/day
+
+def _bb_contraction(df: pd.DataFrame, lookback: int = 120) -> float:
+    # Percentile of today's BB width vs last N; return 1 - pct (higher = tighter than usual)
+    try:
+        w = ((df["BB_UP"] - df["BB_DN"]) / df["Close"]).dropna().tail(lookback)
+        if len(w) < 20: return np.nan
+        ranks = w.rank(pct=True)
+        return float(1.0 - ranks.iloc[-1])
+    except Exception:
+        return np.nan
+
+def _safe_pct(s: pd.Series, n: int) -> float:
+    try: return float(s.pct_change(n).iloc[-1])
+    except Exception: return np.nan
+
+def _pro_metrics(df: pd.DataFrame, bench_df: pd.DataFrame) -> dict:
+    last = df.iloc[-1]
+    close = float(last["Close"])
+    # Relative strength vs SPY
+    rs_bps = rs_slope_bps_per_day(df, bench_df, lookback=20)
+    # Momentum horizons
+    ret20 = _safe_pct(df["Close"], 20)
+    ret60 = _safe_pct(df["Close"], 60)
+    # Trend quality
+    ema20_slope = _lin_slope_bps(df["EMA20"], 20)
+    # Volatility contraction
+    bb_contr = _bb_contraction(df, 120)  # 0..1 (higher is tighter)
+    # Participation today (RVOL)
+    adv20 = float(df["Volume"].rolling(20, min_periods=1).mean().iloc[-1])
+    rvol20 = float(last["Volume"]) / adv20 if adv20 > 0 else np.nan
+    # Range expansion vs ATR
+    prev_close = float(df["Close"].iloc[-2]) if len(df) > 1 else np.nan
+    tr_today = max(
+        float(last["High"] - last["Low"]),
+        abs(float(last["High"]) - prev_close) if np.isfinite(prev_close) else 0.0,
+        abs(float(last["Low"]) - prev_close) if np.isfinite(prev_close) else 0.0
+    )
+    atr = float(last.get("ATR14", np.nan))
+    range_atr = tr_today / atr if atr and np.isfinite(atr) and atr > 0 else np.nan
+    # Proximity to ~200d high (or available window)
+    win = min(252, len(df))
+    hi = float(df["Close"].rolling(win, min_periods=max(40, win//2)).max().iloc[-1]) if win >= 40 else np.nan
+    prox_200h = (close / hi) if (np.isfinite(hi) and hi > 0) else np.nan
+    return {
+        "RS_slope(bps/day)": rs_bps,
+        "RET20": ret20,
+        "RET60": ret60,
+        "EMA20_slope(bps/day)": ema20_slope,
+        "BB_CONTR": bb_contr,
+        "RVOL20": rvol20,
+        "RANGE_ATR": range_atr,
+        "PROX_200D_HIGH": prox_200h,
+    }
+
+def _apply_pro_score(df: pd.DataFrame) -> pd.DataFrame:
+    # Convert raw metrics to 0..1 ranks (percentiles) across the candidate set
+    def pr(col):
+        x = df[col].astype(float)
+        return x.rank(pct=True, na_option="keep")
+    # guard missing columns
+    for c in ["RS_slope(bps/day)","RET20","RET60","EMA20_slope(bps/day)","BB_CONTR","RVOL20","RANGE_ATR","PROX_200D_HIGH"]:
+        if c not in df.columns: df[c] = np.nan
+
+    df["rank_rs"]     = pr("RS_slope(bps/day)")
+    df["rank_ret20"]  = pr("RET20")
+    df["rank_ret60"]  = pr("RET60")
+    df["rank_ema20s"] = pr("EMA20_slope(bps/day)")
+    df["rank_bb"]     = df["BB_CONTR"].astype(float)  # already 0..1
+    df["rank_rvol"]   = pr("RVOL20")
+    df["rank_range"]  = pr("RANGE_ATR")
+    df["rank_prox"]   = pr("PROX_200D_HIGH")
+
+    # Weighted composite (sum to 1.0)
+    df["Score100"] = 100.0 * (
+        0.25*df["rank_rs"]   + 0.15*df["rank_ret20"] + 0.10*df["rank_ret60"] +
+        0.15*df["rank_ema20s"] + 0.10*df["rank_bb"] + 0.15*df["rank_rvol"] +
+        0.10*df["rank_range"] + 0.10*df["rank_prox"]
+    )
+    # Fresh setups get a small kicker
+    if "Fresh" in df.columns:
+        df.loc[df["Fresh"]==True, "Score100"] = df["Score100"] + 5.0
+    return df
+
+# -------- Scanners (freshness + quality filters + Pro Score + fallback) --------
 @st.cache_data(ttl=900, show_spinner=True)
 def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                   min_dollar_vol_millions: float, mode: str, strictness: str = "Balanced",
@@ -533,7 +625,7 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
     stats = {"universe": universe, "start": len(tickers), "after_price": 0,
              "after_liquidity": 0, "ok": 0, "near": 0, "errors": 0, "sample": tickers[:10]}
 
-    rows = []; near_rows = []
+    rows = []; near_rows = []; fallback_pool = []
 
     for t in tickers:
         try:
@@ -556,8 +648,19 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                 continue
             stats["after_liquidity"] += 1
 
+            # PRO metrics (for both ranking and fallback)
+            pro = _pro_metrics(df, bench_df)
+            rs_bps = pro["RS_slope(bps/day)"]
+
+            # add to fallback pool early (after basic gates)
+            fallback_pool.append({
+                "Ticker": t, "Close": round(close,2), "Avg$Vol(20d, M)": round(adv_m,2),
+                "RSI14": round(float(last["RSI14"]),1),
+                "Fresh": False,  # will be True for final matches only
+                **pro
+            })
+
             # --- Quality filters ---
-            rs_bps = rs_slope_bps_per_day(df, bench_df, lookback=20)
             if rs_bps < min_rs_slope:
                 continue
 
@@ -578,8 +681,9 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                     "RSI14":round(float(last["RSI14"]),1),
                     "BandPos(0=low,1=high)": band,
                     "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),
-                    "Fresh": bool(fresh),
-                    "RS_slope(bps/day)": round(rs_bps, 2)}
+                    "Fresh": bool(fresh)}
+            base.update(pro)
+
             if ok:
                 base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
@@ -597,17 +701,33 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
             continue
 
     if rows:
-        out = pd.DataFrame(rows).sort_values(
-            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+        out = pd.DataFrame(rows).copy()
+        out = _apply_pro_score(out)
+        out = out.sort_values(
+            ["Fresh","Score100","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
             ascending=[False,False,False,False,False]
         ).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1))
         return out, stats
 
     if near_rows:
-        out = pd.DataFrame(near_rows).sort_values(
-            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+        out = pd.DataFrame(near_rows).copy()
+        out = _apply_pro_score(out)
+        out = out.sort_values(
+            ["Fresh","Score100","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
             ascending=[False,False,False,False,False]
+        ).head(20).reset_index(drop=True)
+        out.insert(0,"Rank",np.arange(1,len(out)+1))
+        return out, stats
+
+    # Fallback: top-20 by Pro Score (or RS if NaNs)
+    if fallback_pool:
+        out = pd.DataFrame(fallback_pool).copy()
+        out = _apply_pro_score(out)
+        out["Reason"] = "fallback-top-proscore"
+        out = out.sort_values(
+            ["Score100","RS_slope(bps/day)","Avg$Vol(20d, M)"],
+            ascending=[False,False,False]
         ).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1))
         return out, stats
@@ -625,6 +745,8 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
     bench_df = load_benchmark(years)
     stats = {"universe":"Custom","start":len(ticks),"after_price":0,"after_liquidity":0,
              "ok":0,"near":0,"errors":0,"sample":ticks[:10]}
+    fallback_pool = []
+
     for t in ticks:
         try:
             df = load_data(t, years)
@@ -645,8 +767,17 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
                 continue
             stats["after_liquidity"] += 1
 
+            pro = _pro_metrics(df, bench_df)
+            rs_bps = pro["RS_slope(bps/day)"]
+
+            fallback_pool.append({
+                "Ticker": t, "Close": round(close,2), "Avg$Vol(20d, M)": round(adv_m,2),
+                "RSI14": round(float(last["RSI14"]),1),
+                "Fresh": False,
+                **pro
+            })
+
             # --- Quality filters ---
-            rs_bps = rs_slope_bps_per_day(df, bench_df, lookback=20)
             if rs_bps < min_rs_slope:
                 continue
 
@@ -667,8 +798,9 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
                     "RSI14":round(float(last["RSI14"]),1),
                     "BandPos(0=low,1=high)": band,
                     "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),
-                    "Fresh": bool(fresh),
-                    "RS_slope(bps/day)": round(rs_bps, 2)}
+                    "Fresh": bool(fresh)}
+            base.update(pro)
+
             if ok:
                 base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
@@ -684,16 +816,30 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
             stats["errors"] += 1
 
     if rows:
-        out = pd.DataFrame(rows).sort_values(
-            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+        out = pd.DataFrame(rows).copy()
+        out = _apply_pro_score(out)
+        out = out.sort_values(
+            ["Fresh","Score100","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
             ascending=[False,False,False,False,False]
         ).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
 
     if near_rows:
-        out = pd.DataFrame(near_rows).sort_values(
-            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+        out = pd.DataFrame(near_rows).copy()
+        out = _apply_pro_score(out)
+        out = out.sort_values(
+            ["Fresh","Score100","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
             ascending=[False,False,False,False,False]
+        ).head(20).reset_index(drop=True)
+        out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
+
+    if fallback_pool:
+        out = pd.DataFrame(fallback_pool).copy()
+        out = _apply_pro_score(out)
+        out["Reason"] = "fallback-top-proscore"
+        out = out.sort_values(
+            ["Score100","RS_slope(bps/day)","Avg$Vol(20d, M)"],
+            ascending=[False,False,False]
         ).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
 
@@ -859,18 +1005,18 @@ with st.sidebar:
     st.subheader("Market Scanner (no watchlist)")
     universe     = st.selectbox("Universe", ["S&P 500","NASDAQ-100","DOW 30"], index=0, key="scan_universe")
     scan_years   = st.slider("History (years)", 1, 5, 2, key="scan_years")
-    price_min    = st.number_input("Min price ($)", 0.0, value=0.0, step=0.5, key="scan_price_min")
-    price_max    = st.number_input("Max price ($)", 0.0, value=50.0, step=0.5, key="scan_price_max")
+    price_min    = st.number_input("Min price ($)", 0.0, value=5.0, step=0.5, key="scan_price_min")
+    price_max    = st.number_input("Max price ($)", 0.0, value=500.0, step=0.5, key="scan_price_max")
     liq          = st.number_input("Min Avg $ Volume (20d, M)", 0.0, value=1.0, step=0.5, key="scan_min_dollar_vol")
     setup_mode   = st.radio("Setup type", ["Both","Pullback","Breakout"], horizontal=True, key="scan_mode")
     strictness   = st.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0, key="scan_strictness")
     max_symbols  = st.slider("Max symbols to scan", 20, 200, 100, step=10, key="scan_max_symbols")
 
-    # Freshness toggle
-    only_today  = st.checkbox("Only show **new today** setups", value=True, key="scan_only_today",
+    # Freshness toggle (start relaxed to avoid empty lists)
+    only_today  = st.checkbox("Only show **new today** setups", value=False, key="scan_only_today",
                               help="Require the condition to become true today vs yesterday.")
 
-    # Quality filters
+    # Quality filters (start relaxed)
     st.markdown("**Quality filters**")
     min_rs_slope = st.slider("Min RS slope vs SPY (20d, bp/day)", -5.0, 5.0, 0.0, 0.1,
                              help="Relative strength slope of (Close/SPY). >0 means outperforming.")
@@ -1094,6 +1240,11 @@ if st.session_state.ran:
 
     # -------- Trade Plan --------
     st.subheader("Trade Plan (educational)")
+    latest  = df.iloc[-1]
+    trend_up = latest["EMA20"] > latest["EMA50"]
+    atr_val = float(latest["ATR14"]); close = float(latest["Close"])
+    ema20   = float(latest["EMA20"]); ema50 = float(latest["EMA50"])
+    hh20    = float(latest.get("HH20", np.nan)); ll20 = float(latest.get("LL20", np.nan))
     plan = plan_trade(latest, trend_up, atr_val, hh20, ll20, ema20, close,
                       account_size, risk_pct, stop_atr_mult, target_rr, entry_style)
 
