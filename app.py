@@ -3,7 +3,7 @@
 # Run: streamlit run app.py
 # NOTE: Educational tool only. Not financial advice.
 
-import warnings, os, io, json, math, time
+import warnings, os, io, json, math, time, re
 warnings.filterwarnings("ignore")
 
 import datetime as dt
@@ -78,6 +78,7 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([(df["High"]-df["Low"]).abs(), (df["High"]-pc).abs(), (df["Low"]-pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
+# -------- PATCH 1: build_indicators with BANDPOS --------
 def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for c in ["Open","High","Low","Close","Volume"]:
@@ -85,19 +86,32 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
             s = df[c]
             if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
             df[c] = pd.to_numeric(pd.Series(s).squeeze(), errors="coerce")
+
+    # Moving averages
     df["SMA20"] = sma(df["Close"], 20)
     df["SMA50"] = sma(df["Close"], 50)
     df["EMA20"] = ema(df["Close"], 20)
     df["EMA50"] = ema(df["Close"], 50)
+
+    # RSI / MACD / ATR
     df["RSI14"] = rsi(df["Close"], 14)
     m, sig, _ = macd(df["Close"]); df["MACD"] = m; df["MACDsig"] = sig
     df["ATR14"] = atr(df)
+
+    # High/Low windows
     df["HH20"] = df["High"].rolling(20).max()
     df["LL20"] = df["Low"].rolling(20).min()
-    bbw = 20; bbstd = pd.Series(df["Close"], index=df.index).rolling(bbw).std()
+
+    # Bollinger + BANDPOS (0 = lower band, 1 = upper band)
+    bbw = 20
+    bbstd = pd.Series(df["Close"], index=df.index).rolling(bbw).std()
     df["BB_MID"] = sma(df["Close"], bbw)
     df["BB_UP"]  = df["BB_MID"] + 2*bbstd
     df["BB_DN"]  = df["BB_MID"] - 2*bbstd
+    width = (df["BB_UP"] - df["BB_DN"]).replace(0, np.nan)
+    df["BANDPOS"] = ((df["Close"] - df["BB_DN"]) / width).clip(lower=0, upper=1)
+
+    # Simple buy/sell crosses
     cu = (df["EMA20"]>df["EMA50"]) & (df["EMA20"].shift(1)<=df["EMA50"].shift(1))
     cd = (df["EMA20"]<df["EMA50"]) & (df["EMA20"].shift(1)>=df["EMA50"].shift(1))
     df["buy_signal"]  = cu & (df["RSI14"]>50) & (df["Close"]>df["SMA50"])
@@ -118,7 +132,6 @@ def load_data(ticker: str, years: int = 3) -> pd.DataFrame:
         return pd.DataFrame()
 
     def _sym_fix(s: str) -> str:
-        # Yahoo often needs '-' instead of '.'
         return s.replace(".", "-").upper()
 
     end = date.today() + timedelta(days=1)  # include last trading day
@@ -131,7 +144,6 @@ def load_data(ticker: str, years: int = 3) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Promote Adj Close if needed
         if "Close" not in df.columns and "Adj Close" in df.columns:
             df["Close"] = df["Adj Close"]
 
@@ -157,7 +169,7 @@ def load_data(ticker: str, years: int = 3) -> pd.DataFrame:
         approx_rows = int(years * 252) + 40
         return df.tail(approx_rows)
 
-    # ---- Yahoo attempts (no threading for Windows stability) ----
+    # ---- Yahoo attempts ----
     attempts = []
     try:
         dfa = yf.download(_sym_fix(t), start=start, end=end, auto_adjust=True,
@@ -308,13 +320,42 @@ def explain_plan(ticker, trend_up, entry_style, entry, stop, target, rsi_val, at
         else: lines.append("- RSI ~ 40-60 -> neutral; expect chop.")
     return "\n".join(lines)
 
-# ---------------- Watchlist helper ----------------
+# ---------------- Robust Watchlist helper (headered or headerless) ----------------
+def _candidate_sheet_urls(url: str) -> list[str]:
+    u = (url or "").strip()
+    u = re.sub(r"\s+", "", u)
+    cands = [u]
+    if "/pub" in u and "output=csv" in u and "gid=" not in u:
+        sep = "&" if "?" in u else "?"
+        cands.append(f"{u}{sep}single=true&gid=0")
+    seen, out = set(), []
+    for x in cands:
+        if x and x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
+def _read_csv_strict(url: str) -> pd.DataFrame:
+    r = requests.get(url, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return pd.read_csv(io.StringIO(r.text))
+
 def load_watchlist_from_url(url: str) -> list[str]:
-    try:
-        df = pd.read_csv(url, header=None)
-        return [str(t).strip().upper() for t in df.iloc[:, 0].tolist() if str(t).strip()]
-    except Exception:
-        return []
+    last_err = None; tried = []
+    for candidate in _candidate_sheet_urls(url):
+        tried.append(candidate)
+        try:
+            df = _read_csv_strict(candidate)
+            df.columns = [str(c).strip() for c in df.columns]
+            ticker_col = next((c for c in df.columns if c.lower() in ("ticker","symbol")), df.columns[0])
+            syms = [str(t).strip().upper() for t in df[ticker_col].tolist() if str(t).strip()]
+            if syms:
+                return syms
+            last_err = "No tickers found"
+        except Exception as e:
+            last_err = str(e); continue
+    st.warning(f"[watchlist] failed to read CSV from URL: {last_err}\nTried: {', '.join(tried)}")
+    return []
 
 # ---------------- Universes with fallbacks ----------------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -379,18 +420,19 @@ def get_dow30_tickers() -> list[str]:
         pass
     return fallback
 
-# ---------------- Scanner logic ----------------
-def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"):
-    """Return (ok, score, band_pos, reason) given setup mode and strictness."""
-    trend_up = bool(last["EMA20"] > last["EMA50"])
-    rsi_v = float(last["RSI14"])
-    close = float(last["Close"])
-    bb_dn = float(last.get("BB_DN", np.nan))
-    bb_up = float(last.get("BB_UP", np.nan))
-    hh20 = float(last.get("HH20", np.nan))
-    band_pos = np.nan
-    if np.isfinite(bb_dn) and np.isfinite(bb_up) and (bb_up - bb_dn) > 0:
-        band_pos = (close - bb_dn) / (bb_up - bb_dn)
+# -------- PATCH 2: freshness-aware setup logic --------
+def good_position_flags(last: pd.Series, prev: pd.Series, mode: str,
+                        strictness: str = "Balanced", only_today: bool = False):
+    """Return (ok, score, band_pos, reason, fresh_today)."""
+    trend_up  = bool(last["EMA20"] > last["EMA50"])
+    rsi_v     = float(last["RSI14"])
+    rsi_prev  = float(prev["RSI14"]) if "RSI14" in prev else np.nan
+    close     = float(last["Close"])
+    close_p   = float(prev["Close"]) if "Close" in prev else np.nan
+    hh20      = float(last.get("HH20", np.nan))
+    hh20_p    = float(prev.get("HH20", np.nan)) if "HH20" in prev else np.nan
+    band      = float(last.get("BANDPOS", np.nan))
+    band_p    = float(prev.get("BANDPOS", np.nan)) if "BANDPOS" in prev else np.nan
 
     if strictness == "Strict":
         pull_rsi_lo, pull_rsi_hi = 45, 60
@@ -406,26 +448,44 @@ def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"
         brk_near = 0.990; brk_rsi_min = 48
 
     buy_trigger = bool(last.get("buy_signal", False))
-    score = 0; ok = False; reason = []
 
-    cond_pull = trend_up and (pull_rsi_lo <= rsi_v <= pull_rsi_hi) and \
-                (pull_band_lo <= (band_pos if np.isfinite(band_pos) else 0.5) <= pull_band_hi)
-    if mode in ("Pullback","Both") and cond_pull:
-        ok = True; score += 2; reason.append("pullback-window")
+    # Pullback window
+    in_pull  = trend_up and (pull_rsi_lo <= rsi_v <= pull_rsi_hi) and \
+               (pull_band_lo <= (band if np.isfinite(band) else 0.5) <= pull_band_hi)
+    was_pull = (bool(prev.get("EMA20", 0) > prev.get("EMA50", 0))) and \
+               (pull_rsi_lo <= rsi_prev <= pull_rsi_hi) and \
+               (pull_band_lo <= (band_p if np.isfinite(band_p) else 0.5) <= pull_band_hi)
+    pull_fresh = in_pull and (not was_pull)
 
-    near_high = np.isfinite(hh20) and (close >= brk_near*hh20) and trend_up and (rsi_v >= brk_rsi_min)
+    # Breakout near the 20-day high
+    near_high     = np.isfinite(hh20)   and (close   >= brk_near * hh20)   and trend_up and (rsi_v >= brk_rsi_min)
+    was_near_high = np.isfinite(hh20_p) and (close_p >= brk_near * hh20_p) and bool(prev.get("EMA20",0) > prev.get("EMA50",0))
+    brk_fresh = near_high and (not was_near_high)
+
+    ok = False; score = 0; reasons = []; fresh = False
+
+    if mode in ("Pullback","Both") and in_pull:
+        is_fresh = pull_fresh or buy_trigger   # treat a cross day as fresh
+        if (not only_today) or is_fresh:
+            ok = True; fresh = fresh or is_fresh; score += 2
+            reasons.append("pullback-window" + ("-fresh" if is_fresh else ""))
+
     if mode in ("Breakout","Both") and (buy_trigger or near_high):
-        ok = True; score += 2; reason.append("buy-signal" if buy_trigger else "breakout-near-high")
+        is_fresh = buy_trigger or brk_fresh
+        if (not only_today) or is_fresh:
+            ok = True; fresh = fresh or is_fresh; score += 2
+            reasons.append("buy-signal" if buy_trigger else ("breakout-near-high" + ("-fresh" if is_fresh else "")))
 
     if trend_up and rsi_v > 50:
         score += 1
 
-    return ok, score, band_pos, (",".join(reason) if reason else "-")
+    return ok, score, (None if not np.isfinite(band) else round(band,2)), (",".join(reasons) if reasons else "-"), fresh
 
+# -------- PATCH 3: scanners pass prev & respect only_today --------
 @st.cache_data(ttl=900, show_spinner=True)
 def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                   min_dollar_vol_millions: float, mode: str, strictness: str = "Balanced",
-                  max_symbols: int = 100):
+                  only_today: bool = False, max_symbols: int = 100):
     if universe == "S&P 500":
         tickers = get_sp500_tickers()
     elif universe == "NASDAQ-100":
@@ -444,27 +504,35 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
     for t in tickers:
         try:
             df = load_data(t, years)
-            if df.empty: continue
-            df = build_indicators(df); last = df.iloc[-1]
+            if df.empty or len(df) < 2:
+                continue
+            df = build_indicators(df)
+            if len(df) < 2:
+                continue
+            last, prev = df.iloc[-1], df.iloc[-2]
             close = float(last["Close"])
 
-            if not (price_min <= close <= price_max): continue
+            if not (price_min <= close <= price_max):
+                continue
             stats["after_price"] += 1
 
             adv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[-1]
             adv_m = float(adv)/1_000_000.0 if pd.notna(adv) else 0.0
-            if adv_m < min_dollar_vol_millions: continue
+            if adv_m < min_dollar_vol_millions:
+                continue
             stats["after_liquidity"] += 1
 
-            ok, score, band, why = good_position_flags(last, mode, strictness)
+            ok, score, band, why, fresh = good_position_flags(last, prev, mode, strictness, only_today)
             base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
                     "TrendUp":bool(last["EMA20"]>last["EMA50"]),
                     "RSI14":round(float(last["RSI14"]),1),
-                    "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
-                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score)}
+                    "BandPos(0=low,1=high)": band,
+                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),
+                    "Fresh": bool(fresh)}
             if ok:
                 base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
+                # near-miss bucket
                 near_score=0
                 if base["TrendUp"]: near_score += 1
                 if base["RSI14"] >= 48: near_score += 1
@@ -479,23 +547,25 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
 
     if rows:
         out = pd.DataFrame(rows).sort_values(
-            ["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]
+            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
         ).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1))
         return out, stats
 
     if near_rows:
         out = pd.DataFrame(near_rows).sort_values(
-            ["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]
+            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
         ).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1))
         return out, stats
 
     return pd.DataFrame(), stats
 
+
 @st.cache_data(ttl=600, show_spinner=True)
 def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: float,
-                    min_dollar_vol_millions: float, mode: str, strictness: str, max_symbols: int):
+                    min_dollar_vol_millions: float, mode: str, strictness: str,
+                    only_today: bool = False, max_symbols: int = 100):
     rows = []; near_rows = []
     ticks = [t.strip().upper() for t in ticks if t.strip()][:max_symbols]
     stats = {"universe":"Custom","start":len(ticks),"after_price":0,"after_liquidity":0,
@@ -503,21 +573,30 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
     for t in ticks:
         try:
             df = load_data(t, years)
-            if df.empty: continue
-            df = build_indicators(df); last = df.iloc[-1]
+            if df.empty or len(df) < 2:
+                continue
+            df = build_indicators(df)
+            if len(df) < 2:
+                continue
+            last, prev = df.iloc[-1], df.iloc[-2]
             close = float(last["Close"])
-            if not (price_min <= close <= price_max): continue
+            if not (price_min <= close <= price_max):
+                continue
             stats["after_price"] += 1
+
             adv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[-1]
             adv_m = float(adv)/1_000_000.0 if pd.notna(adv) else 0.0
-            if adv_m < min_dollar_vol_millions: continue
+            if adv_m < min_dollar_vol_millions:
+                continue
             stats["after_liquidity"] += 1
-            ok, score, band, why = good_position_flags(last, mode, strictness)
+
+            ok, score, band, why, fresh = good_position_flags(last, prev, mode, strictness, only_today)
             base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
                     "TrendUp":bool(last["EMA20"]>last["EMA50"]),
                     "RSI14":round(float(last["RSI14"]),1),
-                    "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
-                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score)}
+                    "BandPos(0=low,1=high)": band,
+                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),
+                    "Fresh": bool(fresh)}
             if ok:
                 base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
@@ -531,12 +610,19 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
                     near_rows.append(nm); stats["near"] += 1
         except Exception:
             stats["errors"] += 1
+
     if rows:
-        out = pd.DataFrame(rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).reset_index(drop=True)
+        out = pd.DataFrame(rows).sort_values(
+            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
+        ).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
+
     if near_rows:
-        out = pd.DataFrame(near_rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).head(20).reset_index(drop=True)
+        out = pd.DataFrame(near_rows).sort_values(
+            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
+        ).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
+
     return pd.DataFrame(), stats
 
 # ---------------- Local AI helpers (Ollama) ----------------
@@ -706,9 +792,18 @@ with st.sidebar:
     setup_mode   = st.radio("Setup type", ["Both","Pullback","Breakout"], horizontal=True, key="scan_mode")
     strictness   = st.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0, key="scan_strictness")
     max_symbols  = st.slider("Max symbols to scan", 20, 200, 100, step=10, key="scan_max_symbols")
+
+    # -------- PATCH 4: toggle + force refresh --------
+    only_today  = st.checkbox("Only show **new today** setups", value=True, key="scan_only_today",
+                              help="Require the condition to become true today vs yesterday.")
+
     custom_universe = st.text_area("Custom universe (optional, comma tickers)", "", height=60, key="scan_custom_universe")
     debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
     run_market_scan = st.button("Scan Market", key="btn_scan_market")
+
+    if st.button("Force data refresh"):
+        st.cache_data.clear()
+        st.rerun()
 
     # Local AI toggle
     default_ai = os.environ.get("ENABLE_LOCAL_AI","false").lower() == "true"
@@ -764,10 +859,12 @@ if run_screen:
 if run_market_scan:
     if custom_universe.strip():
         tickers_override = [t.strip().upper() for t in custom_universe.split(",") if t.strip()]
-        res, stats = scan_fixed_list(tickers_override, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols)
+        res, stats = scan_fixed_list(tickers_override, scan_years, price_min, price_max, liq,
+                                     setup_mode, strictness, only_today, max_symbols)
         universe_label = f"Custom ({len(tickers_override)})"
     else:
-        res, stats = scan_universe(universe, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols)
+        res, stats = scan_universe(universe, scan_years, price_min, price_max, liq,
+                                   setup_mode, strictness, only_today, max_symbols)
         universe_label = universe
 
     st.subheader(f"Market Scanner Results — {universe_label} ({strictness})")
