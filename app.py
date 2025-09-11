@@ -974,6 +974,7 @@ def score_headlines_vader(headlines: list[dict]):
     return pd.DataFrame(columns=["title","link","published","compound","label"]), 0.0
 
 # ---------------- Sidebar ----------------
+# ---------------- Sidebar (with one-click presets) ----------------
 with st.sidebar:
     ticker    = st.text_input("Stock ticker (e.g., AAPL, MSFT, TSLA)", "AAPL", key="main_ticker_input")
     years     = st.slider("Years of history", 1, 10, 3, key="main_years_slider")
@@ -1012,23 +1013,99 @@ with st.sidebar:
     strictness   = st.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0, key="scan_strictness")
     max_symbols  = st.slider("Max symbols to scan", 20, 200, 100, step=10, key="scan_max_symbols")
 
-    # Freshness toggle (start relaxed to avoid empty lists)
+    # Freshness toggle
     only_today  = st.checkbox("Only show **new today** setups", value=False, key="scan_only_today",
                               help="Require the condition to become true today vs yesterday.")
 
-    # Quality filters (start relaxed)
+    # Quality filters (keys added so presets can set them)
     st.markdown("**Quality filters**")
     min_rs_slope = st.slider("Min RS slope vs SPY (20d, bp/day)", -5.0, 5.0, 0.0, 0.1,
+                             key="scan_min_rs_slope",
                              help="Relative strength slope of (Close/SPY). >0 means outperforming.")
     min_vol_spike = st.slider("Min volume spike × 20d avg (0 = off)", 0.0, 5.0, 0.0, 0.1,
+                              key="scan_min_vol_spike",
                               help="Require Volume ≥ this multiple of 20d average.")
     exclude_earn_days = st.slider("Exclude if earnings within N days (0 = off)", 0, 30, 0,
+                                  key="scan_exclude_earn_days",
                                   help="Skips symbols with upcoming earnings inside this window.")
 
     custom_universe = st.text_area("Custom universe (optional, comma tickers)", "", height=60, key="scan_custom_universe")
     debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
     run_market_scan = st.button("Scan Market", key="btn_scan_market")
 
+    st.markdown("---")
+    # -------- Presets --------
+    st.subheader("Presets")
+
+    def _apply_preset(vals: dict):
+        for k, v in vals.items():
+            st.session_state[k] = v
+        st.rerun()
+
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        if st.button("🔵 Breakout Momentum", use_container_width=True):
+            _apply_preset({
+                "scan_mode": "Breakout",
+                "scan_strictness": "Balanced",
+                "scan_only_today": True,
+                "scan_price_min": 10.0,
+                "scan_price_max": 60.0,
+                "scan_min_dollar_vol": 2.0,
+                "scan_max_symbols": 150,
+                "scan_min_rs_slope": 1.0,     # ≥ +1.0 bp/day
+                "scan_min_vol_spike": 1.5,    # ≥ 1.5× RVOL
+                "scan_exclude_earn_days": 7,
+                "main_entry_style": "Breakout 20-day",
+            })
+    with col_p2:
+        if st.button("🟢 Pullback Uptrend", use_container_width=True):
+            _apply_preset({
+                "scan_mode": "Pullback",
+                "scan_strictness": "Balanced",
+                "scan_only_today": False,
+                "scan_price_min": 5.0,
+                "scan_price_max": 200.0,
+                "scan_min_dollar_vol": 1.0,
+                "scan_max_symbols": 200,
+                "scan_min_rs_slope": 0.4,
+                "scan_min_vol_spike": 0.0,
+                "scan_exclude_earn_days": 5,
+                "main_entry_style": "Pullback to EMA20",
+            })
+
+    col_p3, col_p4 = st.columns(2)
+    with col_p3:
+        if st.button("🟣 Post-Earnings Momentum", use_container_width=True):
+            _apply_preset({
+                "scan_mode": "Both",
+                "scan_strictness": "Balanced",
+                "scan_only_today": True,
+                "scan_price_min": 5.0,
+                "scan_price_max": 500.0,
+                "scan_min_dollar_vol": 1.0,
+                "scan_max_symbols": 200,
+                "scan_min_rs_slope": 0.5,
+                "scan_min_vol_spike": 2.0,
+                "scan_exclude_earn_days": 0,   # allow earnings plays
+                "main_entry_style": "Breakout 20-day",
+            })
+    with col_p4:
+        if st.button("⚪ Baseline (relaxed)", use_container_width=True):
+            _apply_preset({
+                "scan_mode": "Both",
+                "scan_strictness": "Loose",
+                "scan_only_today": False,
+                "scan_price_min": 5.0,
+                "scan_price_max": 500.0,
+                "scan_min_dollar_vol": 1.0,
+                "scan_max_symbols": 200,
+                "scan_min_rs_slope": 0.0,
+                "scan_min_vol_spike": 0.0,
+                "scan_exclude_earn_days": 0,
+            })
+
+    st.markdown("---")
     if st.button("Force data refresh"):
         st.cache_data.clear()
         st.rerun()
@@ -1047,6 +1124,7 @@ with st.sidebar:
         if installed: st.caption("Installed: " + ", ".join(installed[:8]) + ("..." if len(installed)>8 else ""))
         if ollama_available(): st.success("Ollama detected.")
         else: st.info("Ollama not detected. Install from ollama.com, then: ollama pull llama3.2:1b")
+
 
 # ---------------- Top Buttons ----------------
 if st.button("Analyze", key="btn_analyze"):
