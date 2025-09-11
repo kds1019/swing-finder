@@ -78,7 +78,7 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([(df["High"]-df["Low"]).abs(), (df["High"]-pc).abs(), (df["Low"]-pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
-# -------- PATCH 1: build_indicators with BANDPOS --------
+# -------- build_indicators with BANDPOS --------
 def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for c in ["Open","High","Low","Close","Volume"]:
@@ -420,7 +420,7 @@ def get_dow30_tickers() -> list[str]:
         pass
     return fallback
 
-# -------- PATCH 2: freshness-aware setup logic --------
+# -------- Freshness-aware setup logic --------
 def good_position_flags(last: pd.Series, prev: pd.Series, mode: str,
                         strictness: str = "Balanced", only_today: bool = False):
     """Return (ok, score, band_pos, reason, fresh_today)."""
@@ -481,11 +481,43 @@ def good_position_flags(last: pd.Series, prev: pd.Series, mode: str,
 
     return ok, score, (None if not np.isfinite(band) else round(band,2)), (",".join(reasons) if reasons else "-"), fresh
 
-# -------- PATCH 3: scanners pass prev & respect only_today --------
+# -------- Quality filters: RS slope vs SPY --------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_benchmark(years: int = 3, symbol: str = "SPY") -> pd.DataFrame:
+    return load_data(symbol, years)
+
+def rs_slope_bps_per_day(df_sym: pd.DataFrame, df_bench: pd.DataFrame, lookback: int = 20) -> float:
+    """
+    Relative strength series = Close_sym / Close_bench (aligned on dates).
+    Returns slope (basis points per day) of a linear regression over last `lookback` points.
+    """
+    try:
+        if df_sym is None or df_sym.empty or df_bench is None or df_bench.empty:
+            return 0.0
+        s_sym = df_sym["Close"].copy(); s_b = df_bench["Close"].copy()
+        idx = s_sym.index.intersection(s_b.index)
+        if len(idx) < lookback + 2:
+            return 0.0
+        rs = (s_sym.loc[idx] / s_b.loc[idx]).dropna().tail(lookback)
+        if len(rs) < lookback:
+            return 0.0
+        x = np.arange(len(rs)).reshape(-1,1)
+        y = rs.values
+        lr = LinearRegression().fit(x, y)
+        last = float(rs.iloc[-1])
+        if last == 0:
+            return 0.0
+        slope_pct_per_day = lr.coef_[0] / last
+        return float(slope_pct_per_day * 10000.0)  # bps/day
+    except Exception:
+        return 0.0
+
+# -------- Scanners (freshness + quality filters) --------
 @st.cache_data(ttl=900, show_spinner=True)
 def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                   min_dollar_vol_millions: float, mode: str, strictness: str = "Balanced",
-                  only_today: bool = False, max_symbols: int = 100):
+                  only_today: bool = False, max_symbols: int = 100,
+                  min_rs_slope: float = 0.0, min_vol_spike: float = 0.0, exclude_earn_days: int = 0):
     if universe == "S&P 500":
         tickers = get_sp500_tickers()
     elif universe == "NASDAQ-100":
@@ -495,6 +527,8 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
     else:
         tickers = []
     tickers = tickers[:max_symbols]
+
+    bench_df = load_benchmark(years)
 
     stats = {"universe": universe, "start": len(tickers), "after_price": 0,
              "after_liquidity": 0, "ok": 0, "near": 0, "errors": 0, "sample": tickers[:10]}
@@ -522,13 +556,30 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                 continue
             stats["after_liquidity"] += 1
 
+            # --- Quality filters ---
+            rs_bps = rs_slope_bps_per_day(df, bench_df, lookback=20)
+            if rs_bps < min_rs_slope:
+                continue
+
+            if min_vol_spike > 0:
+                vol = float(last.get("Volume", np.nan))
+                adv20 = float(df["Volume"].rolling(20, min_periods=1).mean().iloc[-1])
+                if not (np.isfinite(vol) and adv20 > 0 and (vol >= min_vol_spike * adv20)):
+                    continue
+
+            if exclude_earn_days > 0:
+                nxt_dt, dleft = get_upcoming_earnings(t)
+                if (nxt_dt is not None) and (dleft is not None) and (dleft <= exclude_earn_days):
+                    continue
+
             ok, score, band, why, fresh = good_position_flags(last, prev, mode, strictness, only_today)
             base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
                     "TrendUp":bool(last["EMA20"]>last["EMA50"]),
                     "RSI14":round(float(last["RSI14"]),1),
                     "BandPos(0=low,1=high)": band,
                     "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),
-                    "Fresh": bool(fresh)}
+                    "Fresh": bool(fresh),
+                    "RS_slope(bps/day)": round(rs_bps, 2)}
             if ok:
                 base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
@@ -547,14 +598,16 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
 
     if rows:
         out = pd.DataFrame(rows).sort_values(
-            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
+            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+            ascending=[False,False,False,False,False]
         ).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1))
         return out, stats
 
     if near_rows:
         out = pd.DataFrame(near_rows).sort_values(
-            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
+            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+            ascending=[False,False,False,False,False]
         ).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1))
         return out, stats
@@ -565,9 +618,11 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
 @st.cache_data(ttl=600, show_spinner=True)
 def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: float,
                     min_dollar_vol_millions: float, mode: str, strictness: str,
-                    only_today: bool = False, max_symbols: int = 100):
+                    only_today: bool = False, max_symbols: int = 100,
+                    min_rs_slope: float = 0.0, min_vol_spike: float = 0.0, exclude_earn_days: int = 0):
     rows = []; near_rows = []
     ticks = [t.strip().upper() for t in ticks if t.strip()][:max_symbols]
+    bench_df = load_benchmark(years)
     stats = {"universe":"Custom","start":len(ticks),"after_price":0,"after_liquidity":0,
              "ok":0,"near":0,"errors":0,"sample":ticks[:10]}
     for t in ticks:
@@ -590,13 +645,30 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
                 continue
             stats["after_liquidity"] += 1
 
+            # --- Quality filters ---
+            rs_bps = rs_slope_bps_per_day(df, bench_df, lookback=20)
+            if rs_bps < min_rs_slope:
+                continue
+
+            if min_vol_spike > 0:
+                vol = float(last.get("Volume", np.nan))
+                adv20 = float(df["Volume"].rolling(20, min_periods=1).mean().iloc[-1])
+                if not (np.isfinite(vol) and adv20 > 0 and (vol >= min_vol_spike * adv20)):
+                    continue
+
+            if exclude_earn_days > 0:
+                nxt_dt, dleft = get_upcoming_earnings(t)
+                if (nxt_dt is not None) and (dleft is not None) and (dleft <= exclude_earn_days):
+                    continue
+
             ok, score, band, why, fresh = good_position_flags(last, prev, mode, strictness, only_today)
             base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
                     "TrendUp":bool(last["EMA20"]>last["EMA50"]),
                     "RSI14":round(float(last["RSI14"]),1),
                     "BandPos(0=low,1=high)": band,
                     "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),
-                    "Fresh": bool(fresh)}
+                    "Fresh": bool(fresh),
+                    "RS_slope(bps/day)": round(rs_bps, 2)}
             if ok:
                 base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
@@ -613,13 +685,15 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
 
     if rows:
         out = pd.DataFrame(rows).sort_values(
-            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
+            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+            ascending=[False,False,False,False,False]
         ).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
 
     if near_rows:
         out = pd.DataFrame(near_rows).sort_values(
-            ["Fresh","Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False,False]
+            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
+            ascending=[False,False,False,False,False]
         ).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
 
@@ -785,7 +859,6 @@ with st.sidebar:
     st.subheader("Market Scanner (no watchlist)")
     universe     = st.selectbox("Universe", ["S&P 500","NASDAQ-100","DOW 30"], index=0, key="scan_universe")
     scan_years   = st.slider("History (years)", 1, 5, 2, key="scan_years")
-    # friendlier defaults for "under $50"
     price_min    = st.number_input("Min price ($)", 0.0, value=0.0, step=0.5, key="scan_price_min")
     price_max    = st.number_input("Max price ($)", 0.0, value=50.0, step=0.5, key="scan_price_max")
     liq          = st.number_input("Min Avg $ Volume (20d, M)", 0.0, value=1.0, step=0.5, key="scan_min_dollar_vol")
@@ -793,9 +866,18 @@ with st.sidebar:
     strictness   = st.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0, key="scan_strictness")
     max_symbols  = st.slider("Max symbols to scan", 20, 200, 100, step=10, key="scan_max_symbols")
 
-    # -------- PATCH 4: toggle + force refresh --------
+    # Freshness toggle
     only_today  = st.checkbox("Only show **new today** setups", value=True, key="scan_only_today",
                               help="Require the condition to become true today vs yesterday.")
+
+    # Quality filters
+    st.markdown("**Quality filters**")
+    min_rs_slope = st.slider("Min RS slope vs SPY (20d, bp/day)", -5.0, 5.0, 0.0, 0.1,
+                             help="Relative strength slope of (Close/SPY). >0 means outperforming.")
+    min_vol_spike = st.slider("Min volume spike × 20d avg (0 = off)", 0.0, 5.0, 0.0, 0.1,
+                              help="Require Volume ≥ this multiple of 20d average.")
+    exclude_earn_days = st.slider("Exclude if earnings within N days (0 = off)", 0, 30, 0,
+                                  help="Skips symbols with upcoming earnings inside this window.")
 
     custom_universe = st.text_area("Custom universe (optional, comma tickers)", "", height=60, key="scan_custom_universe")
     debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
@@ -859,16 +941,24 @@ if run_screen:
 if run_market_scan:
     if custom_universe.strip():
         tickers_override = [t.strip().upper() for t in custom_universe.split(",") if t.strip()]
-        res, stats = scan_fixed_list(tickers_override, scan_years, price_min, price_max, liq,
-                                     setup_mode, strictness, only_today, max_symbols)
+        res, stats = scan_fixed_list(
+            tickers_override, scan_years, price_min, price_max, liq,
+            setup_mode, strictness, only_today, max_symbols,
+            min_rs_slope=min_rs_slope, min_vol_spike=min_vol_spike, exclude_earn_days=exclude_earn_days
+        )
         universe_label = f"Custom ({len(tickers_override)})"
     else:
-        res, stats = scan_universe(universe, scan_years, price_min, price_max, liq,
-                                   setup_mode, strictness, only_today, max_symbols)
+        res, stats = scan_universe(
+            universe, scan_years, price_min, price_max, liq,
+            setup_mode, strictness, only_today, max_symbols,
+            min_rs_slope=min_rs_slope, min_vol_spike=min_vol_spike, exclude_earn_days=exclude_earn_days
+        )
         universe_label = universe
 
     st.subheader(f"Market Scanner Results — {universe_label} ({strictness})")
-    st.caption(f"Filters: {universe_label} | ${price_min:.2f} to ${price_max:.2f} | Min Avg $ Vol(20d): {liq:.1f}M | Mode: {setup_mode} | Strictness: {strictness} | Scanned: {stats['start']}")
+    st.caption(f"Filters: {universe_label} | ${price_min:.2f} to ${price_max:.2f} | Min Avg $ Vol(20d): {liq:.1f}M "
+               f"| Mode: {setup_mode} | Strictness: {strictness} | Scanned: {stats['start']} "
+               f"| RS slope≥{min_rs_slope:.1f} bp/d | Vol spike≥{min_vol_spike:.1f}× | Excl earnings≤{exclude_earn_days}d")
 
     if debug_scan:
         st.write({
@@ -883,7 +973,8 @@ if run_market_scan:
         })
 
     if res is None or res.empty:
-        st.info("No candidates met your filters. Try Strictness = Loose, lower Min Avg $ Vol, widen price, or use a Custom universe.")
+        st.info("No candidates met your filters. Try Strictness = Loose, lower Min Avg $ Vol, widen price, "
+                "reduce RS slope/vol spike thresholds, or use a Custom universe.")
     else:
         st.dataframe(res, use_container_width=True)
 
