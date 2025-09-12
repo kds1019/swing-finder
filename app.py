@@ -1,5 +1,5 @@
 # app.py
-# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news
+# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news + ETA timing
 # Run: streamlit run app.py
 # NOTE: Educational tool only. Not financial advice.
 
@@ -226,6 +226,61 @@ def quick_forecast(df: pd.DataFrame, lookback: int = 20):
             "last_close":last,
             "expected_close":float(expc),
             "confidence":conf}
+
+# ---------------- ETA helpers (NEW) ----------------
+def eta_trend_slope_days(df: pd.DataFrame, current_price: float, target_price: float, lookback: int = 20) -> float | None:
+    """
+    Estimate days to target via log-price slope over last `lookback` bars.
+    Returns float days (can be fractional) or None if not estimable.
+    """
+    try:
+        if not (np.isfinite(current_price) and np.isfinite(target_price)): return None
+        if current_price <= 0 or target_price <= 0: return None
+        if target_price <= current_price: return None  # only meaningful for upward moves
+        s = pd.Series(df["Close"]).dropna().tail(max(lookback, 10))
+        if len(s) < 10: return None
+        x = np.arange(len(s)).reshape(-1, 1)
+        y = np.log(s.values)
+        lr = LinearRegression().fit(x, y)
+        slope = float(lr.coef_[0])  # per bar
+        if slope <= 0 or not np.isfinite(slope): return None
+        bars_needed = math.log(target_price / current_price) / slope
+        if bars_needed <= 0 or not np.isfinite(bars_needed): return None
+        # Cap to avoid silly huge numbers
+        return float(min(bars_needed, 200.0))
+    except Exception:
+        return None
+
+def eta_historical_window(df: pd.DataFrame, pct_move: float, lookback_bars: int = 250, max_horizon: int = 60):
+    """
+    Look back over recent `lookback_bars` and measure how many trading days
+    it historically took to reach a +pct_move move from any start.
+    Returns (median_days, q1_days, q3_days) or (None, None, None).
+    """
+    try:
+        if not np.isfinite(pct_move) or pct_move <= 0: return (None, None, None)
+        s = pd.Series(df["Close"]).dropna()
+        if len(s) < 30: return (None, None, None)
+        s = s.tail(lookback_bars)
+        times = []
+        n = len(s)
+        for i in range(n - 2):
+            base = float(s.iloc[i])
+            tgt = base * (1.0 + pct_move)
+            forward = s.iloc[i+1 : min(i+1+max_horizon, n)]
+            hit = np.where(forward.values >= tgt, True, False)
+            if hit.any():
+                days = int(np.argmax(hit) + 1)  # bars forward
+                times.append(days)
+        if not times:
+            return (None, None, None)
+        arr = np.array(times)
+        med = float(np.median(arr))
+        q1  = float(np.percentile(arr, 25))
+        q3  = float(np.percentile(arr, 75))
+        return (med, q1, q3)
+    except Exception:
+        return (None, None, None)
 
 # ---------------- Plot ----------------
 def plot_price(df: pd.DataFrame):
@@ -669,7 +724,8 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
 
             if exclude_earn_days > 0:
                 nxt_dt, dleft = get_upcoming_earnings(t)
-                if (nxt_dt is not None) and (dleft is not None) and (dleft > 0) and (dleft <= exclude_earn_days):
+                if (nxt_dt is not None) and (dleft is not None) and (dleft <= exclude_earn_days) and (dleft >= 0):
+                    # exclude only if *upcoming* within window
                     continue
 
             ok, score, band, why, fresh = good_position_flags(last, prev, mode, strictness, only_today)
@@ -785,7 +841,7 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
 
             if exclude_earn_days > 0:
                 nxt_dt, dleft = get_upcoming_earnings(t)
-                if (nxt_dt is not None) and (dleft is not None) and (dleft > 0) and (dleft <= exclude_earn_days):
+                if (nxt_dt is not None) and (dleft is not None) and (dleft <= exclude_earn_days) and (dleft >= 0):
                     continue
 
             ok, score, band, why, fresh = good_position_flags(last, prev, mode, strictness, only_today)
@@ -901,15 +957,7 @@ def seasonality_tables(df: pd.DataFrame):
     mon_tbl.index = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
     return dow_tbl, mon_tbl
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# UPDATED: Robust earnings helper (next future date if available, else last past)
 def get_upcoming_earnings(ticker: str):
-    """
-    Returns (date, days_delta) where:
-      - if there is a future earnings date: (next_dt, +days_until)
-      - else if only past dates exist:      (last_dt, -days_since)
-      - else: (None, None)
-    """
     try:
         tk = yf.Ticker(ticker)
         dfcal = None
@@ -917,38 +965,23 @@ def get_upcoming_earnings(ticker: str):
             f = getattr(tk, method, None)
             if callable(f):
                 try:
-                    dfcal = f(limit=12)
+                    dfcal = f(limit=6)
                     break
                 except Exception:
                     pass
-        if dfcal is None or len(dfcal) == 0:
+        if dfcal is None or len(dfcal)==0:
             return None, None
-
-        # Normalize to python date objects
         if isinstance(dfcal.index, pd.DatetimeIndex):
-            all_dates = [pd.to_datetime(ix).date() for ix in dfcal.index]
+            next_dt = pd.to_datetime(dfcal.index[0]).date()
         else:
-            cand_cols = [c for c in dfcal.columns if "earn" in str(c).lower() and "date" in str(c).lower()]
-            if not cand_cols:
+            cands = [c for c in dfcal.columns if "earn" in str(c).lower() and "date" in str(c).lower()]
+            if not cands:
                 return None, None
-            series = pd.to_datetime(dfcal[cand_cols[0]], errors="coerce").dropna()
-            all_dates = [d.date() for d in series.tolist()]
-
+            next_dt = pd.to_datetime(dfcal[cands[0]].iloc[0]).date()
         today = date.today()
-        future = [d for d in all_dates if d >= today]
-        if future:
-            next_dt = min(future)
-            return next_dt, (next_dt - today).days
-
-        past = [d for d in all_dates if d < today]
-        if past:
-            last_dt = max(past)
-            return last_dt, (last_dt - today).days  # negative number by design
-
-        return None, None
+        return next_dt, (next_dt - today).days
     except Exception:
         return None, None
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 _analyzer = None
 def _get_vader():
@@ -1339,23 +1372,17 @@ if st.session_state.ran:
             if this_mon in mon_tbl.index:
                 st.caption(f"Current month ({this_mon}) avg next-day: {mon_tbl.loc[this_mon,'avg_next_ret']*100:.2f}%")
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # Updated earnings proximity banner (no more negative "in -N days")
+        # Earnings proximity banner (FIXED)
         nxt_dt, dleft = get_upcoming_earnings(ticker)
-        warn_window = exclude_earn_days if (isinstance(exclude_earn_days, int) and exclude_earn_days >= 0) else 14
-        if warn_window == 0:
-            warn_window = 14  # default if slider is off
-
         if (nxt_dt is not None) and (dleft is not None):
-            if dleft < 0:
-                st.caption(f"Earnings were {-dleft} day(s) ago ({nxt_dt}).")
-            elif dleft == 0:
-                st.warning("Earnings today. Consider avoiding new swing entries.")
-            elif 0 < dleft <= warn_window:
-                st.warning(f"Earnings in {dleft} day(s): {nxt_dt}. Consider reducing size or skipping swings.")
+            if dleft >= 0:
+                msg = f"Earnings in {dleft} day(s): {nxt_dt}."
+                if dleft <= 14:
+                    st.warning(msg + " Consider reducing size or skipping swings.")
+                else:
+                    st.info(msg)
             else:
-                st.info(f"Next earnings in {dleft} day(s): {nxt_dt}.")
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                st.info(f"Last earnings was {abs(dleft)} day(s) ago: {nxt_dt}.")
 
         # Headlines + sentiment
         news = fetch_rss_headlines(ticker, limit=10)
@@ -1401,6 +1428,32 @@ if st.session_state.ran:
     rr_str = f"{rr_val:.2f}" if (isinstance(rr_val, (int, float)) and np.isfinite(rr_val)) else "n/a"
     st.caption(f"Method: {entry_style} | Stop {stop_atr_mult}x ATR | Target {target_rr}R (R = entry - stop). Approx R:R = {rr_str}")
 
+    # -------- Time-to-Target (ETA) — NEW --------
+    try:
+        if plan["target"] > close:
+            eta1 = eta_trend_slope_days(df, current_price=close, target_price=plan["target"], lookback=20)
+            pct_move = (plan["target"] / close) - 1.0 if close > 0 else np.nan
+            med, q1, q3 = eta_historical_window(df, pct_move=pct_move, lookback_bars=250, max_horizon=60)
+
+            st.subheader("Time-to-Target (rough)")
+            ceta1, ceta2 = st.columns(2)
+            with ceta1:
+                if eta1 is not None:
+                    st.metric("Trend slope ETA", f"{eta1:.1f} d", help="Based on recent log-price slope (~20 bars)")
+                else:
+                    st.metric("Trend slope ETA", "n/a")
+            with ceta2:
+                if med is not None:
+                    st.metric("Historical median", f"{med:.0f} d", help="IQR shows middle 50% of similar moves")
+                    if (q1 is not None) and (q3 is not None):
+                        st.caption(f"IQR {q1:.0f}–{q3:.0f} d")
+                else:
+                    st.metric("Historical median", "n/a")
+            st.caption("Educational estimate — volatility & news can change the timing quickly.")
+    except Exception as e:
+        st.info(f"ETA module skipped: {e}")
+
+    # -------- Order ticket --------
     ticket_text, json_bytes, csv_bytes, txt_bytes = make_order_ticket(
         ticker=ticker, side_long=trend_up, entry_style=entry_style,
         entry=plan['entry'], stop=plan['stop'], target=plan['target'], shares=plan['shares'],
