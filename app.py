@@ -631,3 +631,231 @@ if st.button("Analyze", key="btn_analyze"):
     st.session_state.ran = True
 st.button("New analysis (reset)", key="btn_reset",
           on_click=lambda: st.session_state.update(ran=False, last_ai="", last_ai_ts=0.0))
+# ---------------- Watchlist Screener output ----------------
+if run_screen:
+    tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
+    if not tickers:
+        st.warning("No tickers provided.")
+    else:
+        rows = []
+        for t in tickers:
+            sdf = load_data(t, years=screen_years)
+            if sdf.empty: continue
+            sdf = build_indicators(sdf); last = sdf.iloc[-1]
+            close = float(last["Close"])
+            trend_up = bool(last["EMA20"] > last["EMA50"])
+            buy  = bool(last["buy_signal"]); sell = bool(last["sell_signal"])
+            rsi_v = float(last["RSI14"])
+            bb_dn = float(last.get("BB_DN", np.nan)); bb_up = float(last.get("BB_UP", np.nan)); band = np.nan
+            if np.isfinite(bb_dn) and np.isfinite(bb_up) and (bb_up-bb_dn)>0:
+                band = (close - bb_dn)/(bb_up - bb_dn)
+            score = (1 if buy else 0) - (1 if sell else 0) + (1 if (trend_up and rsi_v>50) else 0)
+            rows.append({"Ticker":t,"Close":round(close,2),"TrendUp":trend_up,"RSI14":round(rsi_v,1),
+                         "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
+                         "BUY?":buy,"SELL?":sell,"Score":score})
+        if rows:
+            df_screen = pd.DataFrame(rows).sort_values(["Score","RSI14"], ascending=[False,False]).reset_index(drop=True)
+            st.subheader("Watchlist Screener Results")
+            st.dataframe(df_screen, use_container_width=True)
+        else:
+            st.info("No watchlist candidates met your screener filters.")
+
+# ---------------- Market Scanner output ----------------
+if run_market_scan:
+    if custom_universe.strip():
+        tickers_override = [t.strip().upper() for t in custom_universe.split(",") if t.strip()]
+        res, stats = scan_fixed_list(tickers_override, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols)
+        universe_label = f"Custom ({len(tickers_override)})"
+    else:
+        res, stats = scan_universe(universe, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols)
+        universe_label = universe
+
+    st.subheader(f"Market Scanner Results — {universe_label} ({strictness})")
+    st.caption(f"Filters: {universe_label} | ${price_min:.2f} to ${price_max:.2f} | Min Avg $ Vol(20d): {liq:.1f}M | Mode: {setup_mode} | Strictness: {strictness} | Scanned: {stats['start']}")
+
+    if debug_scan:
+        st.write({
+            "universe": stats["universe"],
+            "start_symbols": stats["start"],
+            "after_price": stats["after_price"],
+            "after_liquidity": stats["after_liquidity"],
+            "ok_setups": stats["ok"],
+            "near_miss": stats["near"],
+            "errors": stats["errors"],
+            "sample_symbols": stats["sample"],
+        })
+
+    if res is None or res.empty:
+        st.info("No candidates met your filters. Try Strictness = Loose, lower Min Avg $ Vol, widen price, or use a Custom universe.")
+    else:
+        st.dataframe(res, use_container_width=True)
+
+# ---------------- Single Ticker analysis ----------------
+if st.session_state.ran:
+    df = load_data(ticker, years)
+    if df.empty:
+        st.error("No data found. Some tickers need exchange suffixes like .L, .TO, .SA.")
+        st.stop()
+    df = build_indicators(df)
+
+    st.subheader(f"{ticker.upper()} price and swing signals")
+    st.plotly_chart(plot_price(df), use_container_width=True)
+
+    latest  = df.iloc[-1]
+    trend_up = latest["EMA20"] > latest["EMA50"]
+    side_txt = "long bias" if trend_up else "short bias"
+    atr_val = float(latest["ATR14"]); close = float(latest["Close"])
+    ema20   = float(latest["EMA20"]); ema50 = float(latest["EMA50"])
+    hh20    = float(latest.get("HH20", np.nan)); ll20 = float(latest.get("LL20", np.nan))
+
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Trend", side_txt); c2.metric("ATR(14)", f"{atr_val:,.2f}"); c3.metric("Last close", f"{close:,.2f}")
+
+    st.subheader("Tiny toy forecast (next session)")
+    fc = quick_forecast(df, lookback=lookback)
+    if fc:
+        d1,d2,d3 = st.columns(3)
+        d1.metric("Direction", "Up" if fc["direction"]=="up" else "Down")
+        d2.metric("Expected close", f"{fc['expected_close']:,.2f}")
+        d3.metric("Confidence-ish", f"{int(fc['confidence']*100)}%")
+        st.caption("Simple momentum estimate. Educational only.")
+    else:
+        st.info("Not enough data to estimate.")
+
+    st.subheader("ML edge (next-day direction)")
+    try:
+        X = pd.concat([
+            pd.Series(df["Close"].pct_change(),   name="RET1"),
+            pd.Series(df["Close"].pct_change(5),  name="RET5"),
+            pd.Series(df["Close"].pct_change(10), name="RET10"),
+            pd.Series((df["High"]-df["Low"])/df["Close"], name="HL_PCT"),
+            pd.Series(df["ATR14"]/df["Close"], name="ATR_PCT"),
+            df[["EMA20","EMA50","SMA20","SMA50","RSI14","MACD","MACDsig"]],
+        ], axis=1).dropna()
+        y = (df["Close"].shift(-1) > df["Close"]).astype(int)
+        y = y.loc[X.index]
+        if len(X) > 200 and y.notna().sum() > 50:
+            Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.25,shuffle=False)
+            clf = RandomForestClassifier(n_estimators=300,max_depth=5,random_state=42,n_jobs=-1)
+            clf.fit(Xtr,ytr)
+            acc = accuracy_score(yte, clf.predict(Xte))
+            proba_up = float(clf.predict_proba(X.iloc[[-1]])[0,1])
+            imps = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False)
+            m1,m2,m3 = st.columns(3)
+            m1.metric("Prob. Up (next day)", f"{proba_up*100:.1f}%")
+            m2.metric("Backtest Accuracy*", f"{acc*100:.1f}%")
+            m3.metric("Top feature", imps.index[0])
+            with st.expander("Feature importances"):
+                st.write(imps.to_frame("importance"))
+            st.caption("*Toy model, simple split. Educational only.")
+        else:
+            st.info("Need more history for ML preview (200+ rows).")
+    except Exception as e:
+        st.warning(f"ML section error: {e}")
+
+    # -------- NEW: Seasonality & News Context --------
+    st.subheader("Seasonality & News Context (experimental)")
+    try:
+        # Seasonality
+        dow_tbl, mon_tbl = seasonality_tables(df)
+        csa, csb = st.columns(2)
+        with csa:
+            st.markdown("**Avg NEXT-day return by weekday**")
+            st.bar_chart(dow_tbl["avg_next_ret"]*100, use_container_width=True)
+            st.caption("Percent. Positive = on average, tomorrow leans up after that weekday.")
+        with csb:
+            st.markdown("**Avg NEXT-day return by month**")
+            st.bar_chart(mon_tbl["avg_next_ret"]*100, use_container_width=True)
+            this_mon = date.today().strftime("%b")
+            if this_mon in mon_tbl.index:
+                st.caption(f"Current month ({this_mon}) avg next-day: {mon_tbl.loc[this_mon,'avg_next_ret']*100:.2f}%")
+
+        # Earnings proximity banner
+        nxt_dt, dleft = get_upcoming_earnings(ticker)
+        if nxt_dt is not None and dleft is not None and dleft <= 14:
+            st.warning(f"Earnings in {dleft} day(s): {nxt_dt}. Consider reducing size or skipping swings.")
+
+        # Headlines + sentiment
+        news = fetch_rss_headlines(ticker, limit=10)
+        if news:
+            df_news, overall = score_headlines_vader(news)
+            colh1, colh2 = st.columns([2,1])
+            with colh1:
+                st.markdown("**Latest headlines**")
+                for _, r in df_news.iterrows():
+                    tag = "🟢" if r["label"]=="Bullish" else ("🔴" if r["label"]=="Bearish" else "⚪")
+                    st.markdown(f"{tag} [{r['title']}]({r['link']})  \n"
+                                f"<span style='opacity:0.7;font-size:0.85em'>{r['published']}</span>",
+                                unsafe_allow_html=True)
+            with colh2:
+                st.metric("Headline sentiment (avg)", f"{overall:+.2f}")
+                st.write(df_news["label"].value_counts())
+        else:
+            st.info("No headlines fetched (RSS may be blocked/limited).")
+    except Exception as e:
+        st.info(f"Seasonality/news module skipped: {e}")
+
+    # -------- Trade Plan --------
+    st.subheader("Trade Plan (educational)")
+    plan = plan_trade(latest, trend_up, atr_val, hh20, ll20, ema20, close,
+                      account_size, risk_pct, stop_atr_mult, target_rr, entry_style)
+
+    colA,colB,colC = st.columns(3)
+    colA.metric("Suggested Entry", f"{plan['entry']:,.2f}")
+    colB.metric("Stop", f"{plan['stop']:,.2f}")
+    colC.metric("Target", f"{plan['target']:,.2f}")
+
+    colD,colE,colF = st.columns(3)
+    colD.metric("Shares", f"{plan['shares']:,}")
+    colE.metric("Risk ($)", f"{plan['risk_dollars']:,.2f}")
+    colF.metric("Est. Reward ($)", f"{plan['reward_dollars']:,.2f}")
+
+    st.caption(f"Method: {entry_style} | Stop {stop_atr_mult}x ATR | Target {target_rr}R (R = entry - stop). Approx R:R = {plan['rr']:.2f}")
+
+    ticket_text, json_bytes, csv_bytes, txt_bytes = make_order_ticket(
+        ticker=ticker, side_long=trend_up, entry_style=entry_style,
+        entry=plan["entry"], stop=plan["stop"], target=plan["target"], shares=plan["shares"],
+        rr=plan["rr"], atr_val=atr_val, risk_dollars=plan["risk_dollars"], reward_dollars=plan["reward_dollars"]
+    )
+
+    st.subheader("Webull Order Ticket (copy/paste)")
+    st.code(ticket_text, language="text")
+    cdl1,cdl2,cdl3 = st.columns(3)
+    with cdl1: st.download_button("Download TXT",  data=txt_bytes,  file_name=f"{ticker.upper()}_ticket.txt",  mime="text/plain",        key="dl_txt")
+    with cdl2: st.download_button("Download JSON", data=json_bytes, file_name=f"{ticker.upper()}_ticket.json", mime="application/json",    key="dl_json")
+    with cdl3: st.download_button("Download CSV",  data=csv_bytes,  file_name=f"{ticker.upper()}_ticket.csv",  mime="text/csv",            key="dl_csv")
+
+    st.subheader("Plan explainer")
+    st.markdown(explain_plan(ticker, trend_up, entry_style, plan["entry"], plan["stop"], plan["target"],
+                             float(latest["RSI14"]), atr_val, ema20, ema50, hh20, ll20))
+
+    # Local AI chat
+    if "AI_ENABLED" in locals() and AI_ENABLED:
+        st.subheader("Ask LOCAL AI about this plan (Ollama)")
+        with st.form("ai_form", clear_on_submit=False):
+            q = st.text_area("Ask a question (education only):", key="ask_llm_text", height=100)
+            ask_now = st.form_submit_button("Ask Local AI")
+        if ask_now and q.strip():
+            now = time.time(); MIN_GAP = 4
+            if now - st.session_state.last_ai_ts < MIN_GAP:
+                wait = int(MIN_GAP - (now - st.session_state.last_ai_ts))
+                st.info(f"Cooling down... try again in ~{wait}s.")
+            else:
+                system = "You are a helpful swing-trading assistant. Be brief and practical. Never give financial advice; this is educational only."
+                context = (f"Ticker: {ticker.upper()}\nBias: {'LONG' if trend_up else 'SHORT'}\n"
+                           f"Entry style: {entry_style}\nEntry: {plan['entry']:.2f}\n"
+                           f"Stop: {plan['stop']:.2f}\nTarget: {plan['target']:.2f}\n"
+                           f"Shares: {plan['shares']}\nATR14: {atr_val:.2f}\nRSI14: {float(latest['RSI14']):.2f}\n"
+                           f"EMA20: {ema20:.2f}  EMA50: {ema50:.2f}\n20d Range: {ll20:.2f} -> {hh20:.2f}\n"
+                           f"Reminder: educational only, not advice.")
+                user_msg = f"{q}\n\nContext:\n{context}"
+                model = locals().get("model_name","llama3.2:1b")
+                if ollama_available():
+                    st.session_state.last_ai = ask_local_llm(model, system, user_msg)
+                else:
+                    st.session_state.last_ai = "(Ollama not running locally.)"
+                st.session_state.last_ai_ts = time.time()
+        if st.session_state.last_ai:
+            st.write(st.session_state.last_ai)
+else:
+    st.info("Type a ticker (e.g., AAPL) and press Analyze.")
