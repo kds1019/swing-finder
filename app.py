@@ -1,42 +1,53 @@
-# app.py — SwingFinder (Part 1/3)
-# Educational tool only. Not financial advice.
+# app.py
+# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news + optional local AI (Ollama)
+# Run: streamlit run app.py
+# NOTE: Educational tool only. Not financial advice.
 
-import warnings, os, io, json, math
+import warnings, os, io, json, math, time
 warnings.filterwarnings("ignore")
 
 import datetime as dt
 from datetime import date, timedelta
-from dataclasses import dataclass
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import yfinance as yf
+import requests
+
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# NEW: sentiment/news deps
+import feedparser
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------------- Streamlit setup ----------------
-st.set_page_config(page_title="SwingFinder", layout="wide")
-st.title("📈 SwingFinder — Screener + Watchlists")
-st.caption("Simple swing helper. Webull-like compatibility + explain-why table. No broker login.")
+st.set_page_config(page_title="Swing Trader (Learn)", layout="wide")
+st.title("Simple Swing Trading Helper")
+st.caption("For learning only. Not financial advice.")
 
 # Session state
-if "ran" not in st.session_state:
-    st.session_state.ran = False
+if "ran" not in st.session_state: st.session_state.ran = False
+if "last_ai" not in st.session_state: st.session_state.last_ai = ""
+if "last_ai_ts" not in st.session_state: st.session_state.last_ai_ts = 0.0
 
 # ---------------- Small helpers ----------------
-def _as_series(x):
-    if isinstance(x, pd.DataFrame):
-        return x.iloc[:, 0]
-    return pd.Series(x).squeeze()
-
-def app_dir() -> str:
+def get_secret(name: str, default=None):
+    v = os.environ.get(name)
+    if v is not None:
+        return v
     try:
-        return os.path.dirname(os.path.abspath(__file__))
-    except NameError:
-        return os.getcwd()
+        return st.secrets[name]
+    except Exception:
+        return default
 
-WATCHLISTS_PATH = os.path.join(app_dir(), "watchlists.json")
+def _as_series(x):
+    if isinstance(x, pd.DataFrame): return x.iloc[:, 0]
+    return pd.Series(x).squeeze()
 
 # ---------------- Indicators ----------------
 def ema(s: pd.Series, span: int) -> pd.Series:
@@ -46,8 +57,7 @@ def sma(s: pd.Series, window: int) -> pd.Series:
     return pd.Series(s, index=s.index).rolling(window).mean()
 
 def rsi(series, period: int = 14) -> pd.Series:
-    if isinstance(series, pd.DataFrame):
-        series = series.iloc[:, 0]
+    if isinstance(series, pd.DataFrame): series = series.iloc[:, 0]
     series = pd.to_numeric(pd.Series(series).squeeze(), errors="coerce")
     d = series.diff()
     g = np.where(d > 0, d, 0.0)
@@ -73,787 +83,450 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["Open","High","Low","Close","Volume"]:
         if c in df.columns:
             s = df[c]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
+            if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
             df[c] = pd.to_numeric(pd.Series(s).squeeze(), errors="coerce")
-
-    # MAs
     df["SMA20"] = sma(df["Close"], 20)
     df["SMA50"] = sma(df["Close"], 50)
     df["EMA20"] = ema(df["Close"], 20)
     df["EMA50"] = ema(df["Close"], 50)
-
-    # RSI / MACD / ATR
     df["RSI14"] = rsi(df["Close"], 14)
     m, sig, _ = macd(df["Close"]); df["MACD"] = m; df["MACDsig"] = sig
     df["ATR14"] = atr(df)
-
-    # High/Low windows
     df["HH20"] = df["High"].rolling(20).max()
     df["LL20"] = df["Low"].rolling(20).min()
-
-    # Bollinger + BANDPOS (0..1)
-    bbw = 20
-    bbstd = pd.Series(df["Close"], index=df.index).rolling(bbw).std()
+    bbw = 20; bbstd = pd.Series(df["Close"], index=df.index).rolling(bbw).std()
     df["BB_MID"] = sma(df["Close"], bbw)
     df["BB_UP"]  = df["BB_MID"] + 2*bbstd
     df["BB_DN"]  = df["BB_MID"] - 2*bbstd
-    width = (df["BB_UP"] - df["BB_DN"]).replace(0, np.nan)
-    df["BANDPOS"] = ((df["Close"] - df["BB_DN"]) / width).clip(lower=0, upper=1)
-
-    # Simple buy/sell crosses
     cu = (df["EMA20"]>df["EMA50"]) & (df["EMA20"].shift(1)<=df["EMA50"].shift(1))
     cd = (df["EMA20"]<df["EMA50"]) & (df["EMA20"].shift(1)>=df["EMA50"].shift(1))
     df["buy_signal"]  = cu & (df["RSI14"]>50) & (df["Close"]>df["SMA50"])
     df["sell_signal"] = cd & (df["RSI14"]<50) & (df["Close"]<df["SMA50"])
     return df
 
-# ---------------- Data loader ----------------
+# ---------------- Data ----------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(ticker: str, years: int = 3) -> pd.DataFrame:
     t = (ticker or "").strip().upper()
     if not t:
         return pd.DataFrame()
+    end = date.today(); start = end - timedelta(days=int(years*365.25))
+    df = yf.download(t, start=start, end=end, auto_adjust=True, progress=False, threads=True)
+    if (df is None or df.empty) and "." in t:
+        alt = t.replace(".","-")
+        df2 = yf.download(alt, start=start, end=end, auto_adjust=True, progress=False, threads=True)
+        if df2 is not None and not df2.empty:
+            df, t = df2, alt
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+    df = df[keep].copy()
+    for c in df.columns:
+        s = df[c]
+        if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
+        df[c] = pd.to_numeric(np.asarray(s).reshape(-1), errors="coerce")
+    return df.dropna()
+# ---------------- Forecast (toy) ----------------
+def quick_forecast(df: pd.DataFrame, lookback: int = 20):
+    s = df["Close"].pct_change().dropna().tail(lookback)
+    if len(s) < 5:
+        return None
+    X = np.arange(len(s)).reshape(-1,1); y = s.values
+    model = LinearRegression().fit(X, y)
+    nxt = float(model.predict(np.array([[len(s)]]))[0])
+    last = float(df["Close"].iloc[-1]); expc = last*(1+nxt)
+    conf = float(min(0.95, max(0.05, abs(model.coef_[0])/(s.std()+1e-9))))
+    return {"direction":"up" if nxt>0 else "down",
+            "next_ret":nxt,
+            "last_close":last,
+            "expected_close":float(expc),
+            "confidence":conf}
 
-    def _sym_fix(s: str) -> str:
-        return s.replace(".", "-").upper()
+# ---------------- Plot ----------------
+def plot_price(df: pd.DataFrame):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="OHLC"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA50"))
+    buys = df[df["buy_signal"]]; sells = df[df["sell_signal"]]
+    fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", marker_symbol="triangle-up", marker_size=10, name="Buy"))
+    fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", marker_symbol="triangle-down", marker_size=10, name="Sell"))
+    fig.update_layout(height=600, xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"),
+                      margin=dict(l=10,r=10,t=30,b=10))
+    return fig
 
-    end = date.today() + timedelta(days=1)
-    start = end - timedelta(days=int(years * 366 + 14))
+# ---------------- Plan & Ticket ----------------
+def plan_trade(latest_row: pd.Series, trend_up: bool, atr_val: float, hh20: float, ll20: float,
+               ema20: float, close: float, account_size: float, risk_pct: float,
+               stop_atr_mult: float, target_rr: float, entry_style: str):
+    risk_d = max(0.0, account_size*(risk_pct/100.0))
+    if entry_style == "Pullback to EMA20":
+        entry = float(ema20)
+        if trend_up:
+            stop = entry - stop_atr_mult*atr_val; target = entry + target_rr*(entry - stop)
+        else:
+            stop = entry + stop_atr_mult*atr_val; target = entry - target_rr*(stop - entry)
+    else:
+        if trend_up:
+            entry = float(max(close, hh20)); stop = entry - stop_atr_mult*atr_val; target = entry + target_rr*(entry - stop)
+        else:
+            entry = float(min(close, ll20)); stop = entry + stop_atr_mult*atr_val; target = entry - target_rr*(stop - entry)
+    sd = abs(entry - stop)
+    shares = int(math.floor(risk_d/sd)) if (sd > 0 and risk_d > 0) else 0
+    notional = shares * entry
+    rr = (abs(target - entry)/sd) if sd > 0 else np.nan
+    reward_d = abs(target - entry) * shares
+    return {"entry":entry,"stop":stop,"target":target,"shares":shares,"risk_dollars":risk_d,
+            "reward_dollars":reward_d,"notional":notional,"rr":rr}
 
-    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if "Close" not in df.columns and "Adj Close" in df.columns:
-            df["Close"] = df["Adj Close"]
-        keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-        if not keep:
-            return pd.DataFrame()
-        df = df[keep].copy()
-        for c in keep:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, errors="coerce")
-        tz = getattr(df.index, "tz", None)
-        if tz is not None:
-            df.index = df.index.tz_convert(None)
-        df = df.dropna().sort_index()
-        if df.empty:
-            return df
-        approx_rows = int(years * 252) + 40
-        return df.tail(approx_rows)
+def make_order_ticket(ticker: str, side_long: bool, entry_style: str, entry: float, stop: float, target: float,
+                      shares: int, rr: float, atr_val: float, risk_dollars: float, reward_dollars: float):
+    bias = "LONG" if side_long else "SHORT"
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"Webull Order Ticket - {now}",
+        f"Ticker: {ticker.upper()}",
+        f"Bias: {bias}",
+        f"Entry style: {entry_style}",
+        f"Entry: {entry:,.2f}",
+        f"Stop: {stop:,.2f}",
+        f"Target: {target:,.2f}",
+        f"Shares: {shares:,}",
+        f"Risk $: {risk_dollars:,.2f}",
+        f"Est. Reward $: {reward_dollars:,.2f}",
+        f"Approx R:R: {rr:.2f}",
+        f"ATR(14): {atr_val:,.2f}",
+        "Notes: Consider a bracket order (entry + stop + limit target)."
+    ]
+    text = "\n".join(lines)
+    payload = {
+        "timestamp": now, "broker": "Webull", "ticker": ticker.upper(), "bias": bias,
+        "entry_style": entry_style, "entry": round(entry, 4), "stop": round(stop, 4),
+        "target": round(target, 4), "shares": int(shares),
+        "risk_dollars": round(risk_dollars, 2), "reward_dollars": round(reward_dollars, 2),
+        "rr": round(rr, 3) if np.isfinite(rr) else None, "atr14": round(atr_val, 4)
+    }
+    json_bytes = io.BytesIO(json.dumps(payload, indent=2).encode("utf-8"))
+    csv_bytes  = io.BytesIO(pd.DataFrame([payload]).to_csv(index=False).encode("utf-8"))
+    txt_bytes  = io.BytesIO(text.encode("utf-8"))
+    return text, json_bytes, csv_bytes, txt_bytes
 
-    attempts = []
+def explain_plan(ticker, trend_up, entry_style, entry, stop, target, rsi_val, atr, ema20, ema50, hh20, ll20):
+    bias = "long" if trend_up else "short"
+    lines = [
+        f"{ticker.upper()} - Plan rationale",
+        f"- Bias: {bias} (EMA20 {'>' if trend_up else '<'} EMA50)",
+        f"- Entry style: {entry_style} at ~{entry:,.2f}",
+        f"- Stop uses ATR ({atr:,.2f}) -> stop ~{stop:,.2f}",
+        f"- Target via R multiple -> ~{target:,.2f}",
+        f"- Trend context: EMA20 {ema20:,.2f}, EMA50 {ema50:,.2f}"
+    ]
+    if pd.notna(hh20) and pd.notna(ll20):
+        lines.append(f"- Recent 20-day range: {ll20:,.2f} -> {hh20:,.2f}")
+    if pd.notna(rsi_val):
+        if rsi_val < 40: lines.append("- RSI < 40 -> weak momentum; be conservative.")
+        elif rsi_val > 60: lines.append("- RSI > 60 -> firm momentum; breakouts may follow through.")
+        else: lines.append("- RSI ~ 40-60 -> neutral; expect chop.")
+    return "\n".join(lines)
+
+# ---------------- Watchlist helper ----------------
+def load_watchlist_from_url(url: str) -> list[str]:
     try:
-        dfa = yf.download(_sym_fix(t), start=start, end=end, auto_adjust=True,
-                          progress=False, threads=False)
-        attempts.append(("yahoo:download(start/end)", _normalize(dfa)))
+        df = pd.read_csv(url, header=None)
+        return [str(t).strip().upper() for t in df.iloc[:, 0].tolist() if str(t).strip()]
     except Exception:
-        attempts.append(("yahoo:download(start/end)", pd.DataFrame()))
-    try:
-        dfb = yf.Ticker(_sym_fix(t)).history(start=start, end=end, auto_adjust=True)
-        attempts.append(("yahoo:ticker.history", _normalize(dfb)))
-    except Exception:
-        attempts.append(("yahoo:ticker.history", pd.DataFrame()))
-    try:
-        dfc = yf.download(_sym_fix(t), period="max", auto_adjust=True,
-                          progress=False, threads=False)
-        attempts.append(("yahoo:download(period=max)", _normalize(dfc)))
-    except Exception:
-        attempts.append(("yahoo:download(period=max)", pd.DataFrame()))
+        return []
 
-    for src, df in attempts:
-        if df is not None and not df.empty:
-            df.attrs["source"] = src
-            return df
-    return pd.DataFrame()
-
-# ---------------- Universes ----------------
+# ---------------- Universes with fallbacks ----------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_sp500_tickers() -> list[str]:
-    return [
-        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","AVGO","TSLA","GOOG","LLY","JPM","V","XOM","JNJ",
-        "WMT","UNH","PG","MA","COST","HD","BAC","MRK","ABBV","KO","PEP","CVX","NFLX","ADBE","CSCO","ACN",
-        "LIN","CRM","AMD","TMO","MCD","INTC","WFC","ABT","BMY","TXN","COP","PM","IBM","AMAT","NEE","GE",
-        "NOW","CAT","ORCL","PFE","QCOM","LOW","MS","HON","RTX","SPGI","AXP","BLK","DE","ISRG","PLD","SCHW","UPS"
+    fallback = [
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","TSLA","AVGO","GOOG",
+        "LLY","JPM","V","XOM","JNJ","WMT","UNH","PG","MA","COST","HD","BAC",
+        "MRK","ABBV","KO","PEP","CVX","NFLX","ADBE","CSCO","ACN","LIN","CRM",
+        "AMD","TMO","MCD","INTC","WFC","ABT","BMY","TXN","COP","PM","IBM",
+        "AMAT","NEE","GE","NOW","CAT","ORCL","PFE","QCOM","LOW","BKNG","MS",
+        "HON","GS","RTX","SPGI","AXP","BLK","DE","ISRG","PLD","SCHW","UPS"
     ]
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        syms = tables[0]["Symbol"].astype(str).tolist()
+        out = [s.replace(".","-").upper().strip() for s in syms if s]
+        return out or fallback
+    except Exception:
+        return fallback
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_nasdaq100_tickers() -> list[str]:
-    return [
+    fallback = [
         "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","NFLX","ADBE",
         "AMD","TSLA","COST","PEP","INTC","CSCO","AMAT","QCOM","PDD","BKNG","LIN",
         "VRTX","TMUS","LRCX","MU","PANW","REGN","ISRG","ADI","HON","GEHC","ZM",
         "ADP","MDLZ","MAR","KDP","ABNB","FTNT","CRWD","MNST","GILD","KLAC","SNPS",
         "NXPI","CSX","MRVL","CHTR","AEP","ORLY","MELI","ODFL","EA","CDNS"
     ]
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        table = None
+        for t in tables:
+            cols = [str(c).lower() for c in t.columns]
+            if "ticker" in cols or "symbol" in cols:
+                table = t; break
+        if table is None: return fallback
+        col = [c for c in table.columns if str(c).lower() in ("ticker","symbol")][0]
+        syms = table[col].astype(str).tolist()
+        out = [s.replace(".","-").upper().strip() for s in syms if s]
+        return out or fallback
+    except Exception:
+        return fallback
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_dow30_tickers() -> list[str]:
-    return [
-        "AAPL","AMGN","AMZN","AXP","BA","CAT","CRM","CSCO","CVX","DIS",
-        "DOW","GS","HD","HON","IBM","INTC","JNJ","JPM","KO","MCD",
-        "MMM","MRK","MSFT","NKE","PG","TRV","UNH","V","VZ","WMT"
-    ]
+# ---------------- Scanner logic ----------------
+def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"):
+    """Return (ok, score, band_pos, reason) given setup mode and strictness."""
+    trend_up = bool(last["EMA20"] > last["EMA50"])
+    rsi_v = float(last["RSI14"])
+    close = float(last["Close"])
+    bb_dn = float(last.get("BB_DN", np.nan))
+    bb_up = float(last.get("BB_UP", np.nan))
+    hh20 = float(last.get("HH20", np.nan))
+    band_pos = np.nan
+    if np.isfinite(bb_dn) and np.isfinite(bb_up) and (bb_up - bb_dn) > 0:
+        band_pos = (close - bb_dn) / (bb_up - bb_dn)
 
-def combined_universe():
-    s = set(get_sp500_tickers()) | set(get_nasdaq100_tickers()) | set(get_dow30_tickers())
-    return sorted(s)
-
-# ---------------- Compatibility (Webull-like) helpers ----------------
-@dataclass
-class ScreenerConfig:
-    use_last_closed_bar: bool = True
-    indicator_source: str = "close"
-    # thresholds from strictness
-    rsi_lo: int = 40
-    rsi_hi: int = 65
-    brk_near: float = 0.990
-    brk_rsi_min: int = 48
-    # meta
-    near_miss_bps: int = 30
-    avgvol_window: int = 20
-    require_all: bool = True
-
-def apply_webull_like_from_strictness(strictness_label: str, near_miss_bps: int) -> ScreenerConfig:
-    cfg = ScreenerConfig()
-    if strictness_label == "Strict":
-        cfg.rsi_lo, cfg.rsi_hi = 45, 60
-        cfg.brk_near, cfg.brk_rsi_min = 0.995, 50
-    elif strictness_label == "Loose":
-        cfg.rsi_lo, cfg.rsi_hi = 35, 70
-        cfg.brk_near, cfg.brk_rsi_min = 0.980, 45
+    if strictness == "Strict":
+        pull_rsi_lo, pull_rsi_hi = 45, 60
+        pull_band_lo, pull_band_hi = 0.10, 0.50
+        brk_near = 0.995; brk_rsi_min = 50
+    elif strictness == "Loose":
+        pull_rsi_lo, pull_rsi_hi = 40, 65
+        pull_band_lo, pull_band_hi = 0.05, 0.70
+        brk_near = 0.985; brk_rsi_min = 47
     else:  # Balanced
-        cfg.rsi_lo, cfg.rsi_hi = 40, 65
-        cfg.brk_near, cfg.brk_rsi_min = 0.990, 48
-    cfg.near_miss_bps = int(near_miss_bps)
-    return cfg
+        pull_rsi_lo, pull_rsi_hi = 43, 62
+        pull_band_lo, pull_band_hi = 0.08, 0.60
+        brk_near = 0.990; brk_rsi_min = 48
 
-def _passes_rules_row(last: pd.Series, cfg: ScreenerConfig) -> tuple[bool, dict]:
-    eps = float(last["Close"]) * (cfg.near_miss_bps / 10_000.0)  # bps -> price units
+    buy_trigger = bool(last.get("buy_signal", False))
+    score = 0; ok = False; reason = []
 
-    ema20 = float(last["EMA20"]); ema50 = float(last["EMA50"])
-    rsi14 = float(last["RSI14"]) if pd.notna(last["RSI14"]) else np.nan
-    close = float(last["Close"])
-    hh20  = float(last.get("HH20", np.nan))
-    band  = float(last.get("BANDPOS", np.nan))
+    cond_pull = trend_up and (pull_rsi_lo <= rsi_v <= pull_rsi_hi) and \
+                (pull_band_lo <= (band_pos if np.isfinite(band_pos) else 0.5) <= pull_band_hi)
+    if mode in ("Pullback","Both") and cond_pull:
+        ok = True; score += 2; reason.append("pullback-window")
 
-    trend_up = ema20 > ema50
-    checks = {
-        "trend_up": trend_up,
-        "rsi_band": (rsi14 >= (cfg.rsi_lo - 0.5)) and (rsi14 <= (cfg.rsi_hi + 0.5)),
-        "price_above_ema20": close > (ema20 - eps),
-        "ema20_gt_ema50": (ema20 - ema50) > -1e-9,
-        "near_20d_high": (np.isfinite(hh20) and trend_up and (close >= cfg.brk_near * hh20) and (rsi14 >= cfg.brk_rsi_min)),
-        "bandpos_ok": (0.0 <= (band if np.isfinite(band) else 0.5) <= 1.0),
-        "macd_hist_nonneg": (float(last["MACD"]) - float(last["MACDsig"])) >= (-eps / max(close, 1e-6)),
-    }
-    ok = all(checks.values()) if cfg.require_all else (sum(bool(v) for v in checks.values()) >= 5)
-    return ok, checks
+    near_high = np.isfinite(hh20) and (close >= brk_near*hh20) and trend_up and (rsi_v >= brk_rsi_min)
+    if mode in ("Breakout","Both") and (buy_trigger or near_high):
+        ok = True; score += 2; reason.append("buy-signal" if buy_trigger else "breakout-near-high")
 
-def _pro_metrics(df: pd.DataFrame) -> dict:
-    last = df.iloc[-1]
-    close = float(last["Close"])
-    win = min(60, len(df))
-    if win >= 10:
-        base = float(df["Close"].iloc[-win])
-        rs_slope = (close / base) ** (1/win) - 1.0
-    else:
-        rs_slope = 0.0
-    adv20 = float(df["Volume"].rolling(20, min_periods=1).mean().iloc[-1])
-    rvol20 = float(last["Volume"]) / adv20 if adv20 > 0 else np.nan
-    return {"RS_slope(bps/day)": float(rs_slope * 10000.0), "RVOL20": rvol20}
+    if trend_up and rsi_v > 50:
+        score += 1
 
-def _explain_failures(ticker: str, checks: dict, last: pd.Series,
-                      price_min: float, price_max: float, adv_m: float,
-                      min_dollar_vol_millions: float) -> dict:
-    reasons = []
-    close = float(last["Close"])
-    if close < price_min: reasons.append(f"Price {close:.2f} < min {price_min:.2f}")
-    if close > price_max: reasons.append(f"Price {close:.2f} > max {price_max:.2f}")
-    if adv_m < min_dollar_vol_millions: reasons.append(f"Avg$Vol20 {adv_m:.2f}M < min {min_dollar_vol_millions:.2f}M")
-    for k, v in checks.items():
-        if v:
-            continue
-        if k == "trend_up":
-            reasons.append("EMA20 ≤ EMA50 (no uptrend)")
-        elif k == "rsi_band":
-            reasons.append("RSI14 outside band")
-        elif k == "price_above_ema20":
-            reasons.append("Close not above EMA20 (within band?)")
-        elif k == "ema20_gt_ema50":
-            reasons.append("EMA20 ≤ EMA50")
-        elif k == "near_20d_high":
-            reasons.append("Not near 20-day high (or RSI too low)")
-        elif k == "bandpos_ok":
-            reasons.append("BandPos out of 0..1 (insufficient BB window)")
-        elif k == "macd_hist_nonneg":
-            reasons.append("MACD histogram ≤ 0")
-    if not reasons:
-        reasons.append("Filtered by other criteria or data quality")
-    return {"Ticker": ticker, "Why excluded": "; ".join(reasons)}
+    return ok, score, band_pos, (",".join(reason) if reason else "-")
 
-# ---------------- Screener core ----------------
 @st.cache_data(ttl=900, show_spinner=True)
-def scan_list(ticks: list[str], years: int, price_min: float, price_max: float,
-              min_dollar_vol_millions: float, strictness_label: str,
-              min_rs_slope: float = 0.0, include_near: bool = True, max_symbols: int = 400,
-              near_miss_bps: int = 30, explain: bool = True):
-    cfg = apply_webull_like_from_strictness(strictness_label, near_miss_bps=near_miss_bps)
+def scan_universe(universe: str, years: int, price_min: float, price_max: float,
+                  min_dollar_vol_millions: float, mode: str, strictness: str = "Balanced",
+                  max_symbols: int = 100):
+    if universe == "S&P 500":
+        tickers = get_sp500_tickers()
+    elif universe == "NASDAQ-100":
+        tickers = get_nasdaq100_tickers()
+    else:
+        tickers = []
+    tickers = tickers[:max_symbols]
+
+    stats = {"universe": universe, "start": len(tickers), "after_price": 0,
+             "after_liquidity": 0, "ok": 0, "near": 0, "errors": 0, "sample": tickers[:10]}
+
+    rows = []; near_rows = []
+
+    for t in tickers:
+        try:
+            df = load_data(t, years)
+            if sdf := df is None: pass  # no-op to keep linter quiet if needed
+            if df.empty: continue
+            df = build_indicators(df); last = df.iloc[-1]
+            close = float(last["Close"])
+
+            if not (price_min <= close <= price_max): continue
+            stats["after_price"] += 1
+
+            adv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[-1]
+            adv_m = float(adv)/1_000_000.0 if pd.notna(adv) else 0.0
+            if adv_m < min_dollar_vol_millions: continue
+            stats["after_liquidity"] += 1
+
+            ok, score, band, why = good_position_flags(last, mode, strictness)
+            base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
+                    "TrendUp":bool(last["EMA20"]>last["EMA50"]),
+                    "RSI14":round(float(last["RSI14"]),1),
+                    "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
+                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score)}
+            if ok:
+                base["Reason"]=why; rows.append(base); stats["ok"] += 1
+            else:
+                near_score=0
+                if base["TrendUp"]: near_score += 1
+                if base["RSI14"] >= 48: near_score += 1
+                bp = base["BandPos(0=low,1=high)"]
+                if bp is not None and bp <= 0.75: near_score += 1
+                if near_score >= 2:
+                    nm = dict(base); nm["Reason"]="near-miss"; nm["Score"]=max(nm["Score"], near_score)
+                    near_rows.append(nm); stats["near"] += 1
+        except Exception:
+            stats["errors"] += 1
+            continue
+
+    if rows:
+        out = pd.DataFrame(rows).sort_values(
+            ["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]
+        ).reset_index(drop=True)
+        out.insert(0,"Rank",np.arange(1,len(out)+1))
+        return out, stats
+
+    if near_rows:
+        out = pd.DataFrame(near_rows).sort_values(
+            ["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]
+        ).head(20).reset_index(drop=True)
+        out.insert(0,"Rank",np.arange(1,len(out)+1))
+        return out, stats
+
+    return pd.DataFrame(), stats
+
+@st.cache_data(ttl=600, show_spinner=True)
+def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: float,
+                    min_dollar_vol_millions: float, mode: str, strictness: str, max_symbols: int):
+    rows = []; near_rows = []
     ticks = [t.strip().upper() for t in ticks if t.strip()][:max_symbols]
-
-    rows, near_rows, explain_rows = [], [], []
-
+    stats = {"universe":"Custom","start":len(ticks),"after_price":0,"after_liquidity":0,
+             "ok":0,"near":0,"errors":0,"sample":ticks[:10]}
     for t in ticks:
         try:
-            df = load_data(t, years=years)
-            if df.empty or len(df) < 30:
-                if explain:
-                    explain_rows.append({"Ticker": t, "Why excluded": "Too little history / load failed"})
-                continue
-
-            df = build_indicators(df)
-            last = df.iloc[-1]
-
-            # Hard filters
+            df = load_data(t, years)
+            if df.empty: continue
+            df = build_indicators(df); last = df.iloc[-1]
             close = float(last["Close"])
-            adv = (df["Close"]*df["Volume"]).rolling(cfg.avgvol_window).mean().iloc[-1]
+            if not (price_min <= close <= price_max): continue
+            stats["after_price"] += 1
+            adv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[-1]
             adv_m = float(adv)/1_000_000.0 if pd.notna(adv) else 0.0
-
-            if not (price_min <= close <= price_max) or (adv_m < min_dollar_vol_millions):
-                if explain:
-                    explain_rows.append(_explain_failures(t, {}, last, price_min, price_max, adv_m, min_dollar_vol_millions))
-                continue
-
-            # RS slope (bps/day)
-            pro = _pro_metrics(df)
-            if pro["RS_slope(bps/day)"] < (min_rs_slope * 100):
-                if include_near:
-                    near_rows.append({
-                        "Ticker": t, "Close": round(close,2),
-                        "Avg$Vol(20d, M)": round(adv_m,2),
-                        "RSI14": round(float(last["RSI14"]),1),
-                        "BandPos(0=low,1=high)": float(last.get("BANDPOS", np.nan)),
-                        **pro, "Reason": "RS slope below min"
-                    })
-                else:
-                    if explain:
-                        explain_rows.append({"Ticker": t, "Why excluded": "RS slope below minimum"})
-                continue
-
-            # Webull-like checks
-            ok, checks = _passes_rules_row(last, cfg)
-            base = {
-                "Ticker": t, "Close": round(close,2), "Avg$Vol(20d, M)": round(adv_m,2),
-                "TrendUp": bool(last["EMA20"] > last["EMA50"]),
-                "RSI14": round(float(last["RSI14"]),1),
-                "BandPos(0=low,1=high)": (None if pd.isna(last.get("BANDPOS", np.nan)) else round(float(last["BANDPOS"]),2)),
-                "BUY?": bool(last.get("buy_signal", False)),
-                "Score": int(sum(bool(v) for v in checks.values())),
-                "Fresh": False,
-                **pro
-            }
-
+            if adv_m < min_dollar_vol_millions: continue
+            stats["after_liquidity"] += 1
+            ok, score, band, why = good_position_flags(last, mode, strictness)
+            base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
+                    "TrendUp":bool(last["EMA20"]>last["EMA50"]),
+                    "RSI14":round(float(last["RSI14"]),1),
+                    "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
+                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score)}
             if ok:
-                base["Reason"] = "pass"
-                rows.append(base)
+                base["Reason"]=why; rows.append(base); stats["ok"] += 1
             else:
-                if include_near:
-                    nm = dict(base)
-                    nm["Reason"] = "near-miss"
-                    nm["Score"] = max(nm["Score"], 1)
-                    near_rows.append(nm)
-                if explain:
-                    explain_rows.append(_explain_failures(t, checks, last, price_min, price_max, adv_m, min_dollar_vol_millions))
-
+                near_score=0
+                if base["TrendUp"]: near_score += 1
+                if base["RSI14"] >= 48: near_score += 1
+                bp = base["BandPos(0=low,1=high)"]
+                if bp is not None and bp <= 0.75: near_score += 1
+                if near_score >= 2:
+                    nm = dict(base); nm["Reason"]="near-miss"; nm["Score"]=max(nm["Score"], near_score)
+                    near_rows.append(nm); stats["near"] += 1
         except Exception:
-            if explain:
-                explain_rows.append({"Ticker": t, "Why excluded": "Exception during screening"})
-            continue
+            stats["errors"] += 1
+    if rows:
+        out = pd.DataFrame(rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).reset_index(drop=True)
+        out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
+    if near_rows:
+        out = pd.DataFrame(near_rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).head(20).reset_index(drop=True)
+        out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
+    return pd.DataFrame(), stats
+# ---------------- Local AI helpers (Ollama) ----------------
+def ollama_available():
+    try: return requests.get("http://127.0.0.1:11434/api/tags", timeout=2).status_code == 200
+    except Exception: return False
 
-    df_ok   = pd.DataFrame(rows)
-    df_near = pd.DataFrame(near_rows)
-    df_exp  = pd.DataFrame(explain_rows)
-
-    if not df_ok.empty:
-        df_ok = df_ok.sort_values(
-            ["Fresh","Score","RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
-            ascending=[False,False,False,False,False]
-        ).reset_index(drop=True)
-        df_ok.insert(0,"Rank",np.arange(1,len(df_ok)+1))
-
-    if not df_near.empty:
-        df_near = df_near.sort_values(
-            ["RS_slope(bps/day)","Avg$Vol(20d, M)","RSI14"],
-            ascending=[False,False,False]
-        ).reset_index(drop=True)
-        df_near.insert(0,"Rank",np.arange(1,len(df_near)+1))
-
-    if not df_exp.empty:
-        df_exp = df_exp.sort_values(["Why excluded","Ticker"]).reset_index(drop=True)
-
-    return df_ok, df_near, df_exp
-# =========================
-# Part 2/3 — Watchlists + Screener UI
-# =========================
-
-# ---------------- In-App Watchlist Manager (auto-persist) ----------------
-def init_watchlists_state():
-    if "saved_watchlists" not in st.session_state:
-        st.session_state.saved_watchlists = {}
-    if "active_watchlist" not in st.session_state:
-        st.session_state.active_watchlist = []
-
-def load_watchlists_from_disk():
+def list_ollama_models():
     try:
-        if os.path.exists(WATCHLISTS_PATH):
-            with open(WATCHLISTS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    st.session_state.saved_watchlists.update({
-                        k: [s.strip().upper() for s in v if str(s).strip()]
-                        for k,v in data.items() if isinstance(v, list)
-                    })
+        r = requests.get("http://127.0.0.1:11434/api/tags", timeout=2)
+        r.raise_for_status()
+        return [m.get("name") for m in r.json().get("models", []) if m.get("name")]
     except Exception:
-        pass
+        return []
 
-def save_watchlists_to_disk():
-    try:
-        with open(WATCHLISTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.saved_watchlists, f, indent=2)
-    except Exception:
-        pass
-
-def export_watchlists_json():
-    return io.BytesIO(json.dumps(st.session_state.saved_watchlists, indent=2).encode("utf-8"))
-
-def delete_watchlist(name: str):
-    if name in st.session_state.saved_watchlists:
-        st.session_state.saved_watchlists.pop(name, None)
-        save_watchlists_to_disk()
-
-def save_watchlist(name: str, symbols: list[str]):
-    syms = [s.strip().upper() for s in symbols if str(s).strip()]
-    if not syms or not name:
-        return False, "Need a name and at least one ticker"
-    st.session_state.saved_watchlists[name] = syms
-    save_watchlists_to_disk()
-    return True, f"✅ Saved {len(syms)} symbols to watchlist '{name}'"
-
-# init + auto-load from disk once
-init_watchlists_state()
-if "watchlists_loaded_once" not in st.session_state:
-    load_watchlists_from_disk()
-    st.session_state.watchlists_loaded_once = True
-
-st.subheader("📋 Watchlists")
-
-# Quick buttons for saved lists
-if st.session_state.saved_watchlists:
-    st.write("Click to load a saved watchlist:")
-    cols = st.columns(min(len(st.session_state.saved_watchlists), 4))
-    for i, (name, tickers) in enumerate(st.session_state.saved_watchlists.items()):
-        col = cols[i % max(1, len(cols))]
-        if col.button(name, key=f"load_{name}"):
-            st.session_state.active_watchlist = tickers.copy()
-            st.success(f"Loaded watchlist: {name}")
-            st.rerun()
-else:
-    st.info("No saved watchlists yet. Create or import below.")
-
-# Active list editor
-wl_input = st.text_area(
-    "Active Watchlist (comma separated tickers)",
-    value=", ".join(st.session_state.active_watchlist),
-    height=80,
-    key="active_watchlist_input"
-)
-st.session_state.active_watchlist = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
-
-# Save current as named list
-new_name = st.text_input("Save current list as:", "", key="save_list_name")
-if st.button("💾 Save Watchlist", key="btn_save_list") and new_name.strip():
-    ok, msg = save_watchlist(new_name.strip(), st.session_state.active_watchlist)
-    (st.success if ok else st.error)(msg)
-    if ok: st.rerun()
-
-# Export all watchlists
-if st.session_state.saved_watchlists:
-    json_bytes = export_watchlists_json()
-    st.download_button("⬇️ Download All Watchlists (JSON)", data=json_bytes,
-                       file_name="watchlists.json", mime="application/json",
-                       key="dl_all_watchlists")
-
-# Import JSON Watchlists
-with st.expander("📥 Import Watchlists from JSON"):
-    uploaded = st.file_uploader("Upload watchlists.json file", type=["json"], key="upl_watchlists")
-    if uploaded is not None:
+def ask_local_llm(model_name: str, system_text: str, user_text: str, max_retries: int = 3) -> str:
+    url = "http://127.0.0.1:11434/api/chat"
+    payload = {"model":model_name, "messages":[{"role":"system","content":system_text},{"role":"user","content":user_text}], "stream":False}
+    fallbacks = ["llama3.2:1b","tinyllama:1.1b","qwen2.5:0.5b"]; tried=[model_name]; last=None
+    for i in range(max_retries):
         try:
-            data = json.load(uploaded)
-            if isinstance(data, dict):
-                for k,v in data.items():
-                    if isinstance(v, list):
-                        st.session_state.saved_watchlists[k] = [s.strip().upper() for s in v if str(s).strip()]
-                save_watchlists_to_disk()
-                st.success("✅ Watchlists imported successfully")
-                st.rerun()
-            else:
-                st.error("❌ Invalid format. Expected a dictionary of lists.")
+            r = requests.post(url, json=payload, timeout=120)
+            if r.status_code == 200:
+                return r.json().get("message", {}).get("content", "").strip()
+            txt = r.text or ""
+            if r.status_code == 500 and "requires more system memory" in txt:
+                for fb in fallbacks:
+                    if fb in tried: continue
+                    tried.append(fb); payload["model"] = fb
+                    rr = requests.post(url, json=payload, timeout=120)
+                    if rr.status_code == 200:
+                        return f"(Used fallback {fb})\n\n" + rr.json().get("message", {}).get("content", "").strip()
+                return "(Local AI chat error: model too large; use a smaller model.)"
+            if r.status_code in (404, 400) and ("not found" in txt.lower() or "pull" in txt.lower()):
+                return "(Model not found. In PowerShell run:  ollama pull llama3.2:1b  then select it.)"
+            last = f"HTTP {r.status_code}: {txt[:200]}"
         except Exception as e:
-            st.error(f"❌ Import failed: {e}")
+            last = str(e)
+        time.sleep(2**i)
+    return f"(Local AI chat error after retries: {last})"
 
-# ---------------- Sidebar Controls ----------------
-with st.sidebar:
-    st.header("⚙️ Screener Settings")
-    uni_choice = st.selectbox("Universe",
-        ["All (Combined)","S&P 500","NASDAQ-100","DOW 30"], index=0, key="universe_select")
+# ---------------- Seasonality & News helpers ----------------
+def _prep_series_for_ts(df: pd.DataFrame) -> pd.Series:
+    s = df["Close"].copy()
+    s.index = pd.DatetimeIndex(s.index)
+    return s.asfreq("B").ffill()
 
-    years_back   = st.slider("History (years)", 1, 5, 2, key="hist_years")
-    price_min    = st.number_input("Min price ($)", 0.0, value=5.0, step=0.5, key="min_price")
-    price_max    = st.number_input("Max price ($)", 0.0, value=60.0, step=1.0, key="max_price")
-    liq_min      = st.number_input("Min Avg $ Vol (20d, M)", 0.0, value=0.5, step=0.5, key="min_liq")
-    strictness   = st.selectbox("Strictness", ["Loose","Balanced","Strict"], index=1, key="strictness")
-    min_rs_slope = st.slider("Min RS slope (bp/day)", -5.0, 5.0, 0.0, 0.1, key="min_rs")
-    include_near = st.checkbox("Also show near-miss list", value=True, key="include_near")
+def seasonality_tables(df: pd.DataFrame):
+    s = _prep_series_for_ts(df)
+    ret_next = s.pct_change().shift(-1)
+    dfw = pd.DataFrame({"ret_next": ret_next})
+    dfw["dow"] = dfw.index.dayofweek
+    dfw["mon"] = dfw.index.month
 
-    st.markdown("### Compatibility (Webull-like)")
-    near_miss_bps = st.slider("Near-miss band (bps)", 0, 100, 30, step=5,
-                              help="Tolerance around thresholds so results align with Webull-like semantics",
-                              key="near_miss_bps")
-    explain_drops = st.checkbox("Explain why tickers were excluded", value=True, key="explain_drops")
+    dow_tbl = dfw.groupby("dow")["ret_next"].mean().reindex([0,1,2,3,4]).to_frame("avg_next_ret").dropna()
+    dow_tbl.index = ["Mon","Tue","Wed","Thu","Fri"]
 
-    st.markdown("---")
-    st.caption("Daily bars • last closed candle • Close price source • BB 20/2")
+    mon_order = list(range(1,13))
+    mon_tbl = dfw.groupby("mon")["ret_next"].mean().reindex(mon_order).to_frame("avg_next_ret").dropna()
+    mon_tbl.index = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    return dow_tbl, mon_tbl
 
-# Resolve universe
-if uni_choice == "All (Combined)":
-    universe_ticks = combined_universe()
-elif uni_choice == "S&P 500":
-    universe_ticks = get_sp500_tickers()
-elif uni_choice == "NASDAQ-100":
-    universe_ticks = get_nasdaq100_tickers()
-else:
-    universe_ticks = get_dow30_tickers()
-
-# ---------------- Screener Run + Save to Watchlist ----------------
-st.header("📊 Screener")
-if st.button("🔎 Run Screener", key="btn_run_screener"):
-    res_ok, res_near, res_explain = scan_list(
-        universe_ticks, years_back, price_min, price_max, liq_min,
-        strictness_label=strictness, min_rs_slope=min_rs_slope, include_near=include_near,
-        near_miss_bps=near_miss_bps, explain=explain_drops
-    )
-
-    if res_ok is not None and not res_ok.empty:
-        st.subheader("✅ Matches")
-        st.dataframe(res_ok, use_container_width=True)
-    else:
-        st.info("No strict matches — loosen filters or check Near-Misses.")
-
-    if include_near and (res_near is not None) and (not res_near.empty):
-        st.subheader("⚠️ Near-Miss Candidates")
-        st.dataframe(res_near, use_container_width=True)
-
-    if explain_drops and (res_explain is not None) and (not res_explain.empty):
-        st.subheader("🧐 Why some tickers were excluded")
-        st.dataframe(res_explain, use_container_width=True)
-
-    # Gather tickers from this run
-    tickers_from_run = []
-    if res_ok is not None and not res_ok.empty:
-        tickers_from_run += list(res_ok["Ticker"])
-    if include_near and res_near is not None and not res_near.empty:
-        tickers_from_run += list(res_near["Ticker"])
-
-    # Auto-save last run so you never lose it
-    if tickers_from_run:
-        save_watchlist("Last Screener Results", tickers_from_run)
-
-        st.subheader("💾 Save Screener Results")
-        wl_name = st.text_input("Name this watchlist", value="Picks " + date.today().isoformat(), key="name_save_screener")
-        if st.button("Save Screener Results", key="btn_save_screener_results"):
-            ok, msg = save_watchlist(wl_name.strip(), tickers_from_run)
-            (st.success if ok else st.error)(msg)
-            if ok: st.rerun()
-
-# ---------------- Saved Watchlists management ----------------
-if st.session_state.saved_watchlists:
-    st.header("📂 Saved Watchlists")
-
-    # --- Show Last Screener Results separately ---
-    if "Last Screener Results" in st.session_state.saved_watchlists:
-        syms = st.session_state.saved_watchlists["Last Screener Results"]
-        st.subheader("🕒 Last Screener Results")
-        st.write(", ".join(syms))
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("📊 Re-scan Last Screener Results", key="rescan_last_screener"):
-                res_ok, res_near, res_explain = scan_list(
-                    syms, years_back, price_min, price_max, liq_min,
-                    strictness_label=strictness, min_rs_slope=min_rs_slope, include_near=include_near,
-                    near_miss_bps=near_miss_bps, explain=explain_drops
-                )
-                st.subheader("Re-scan — Last Screener Results")
-                if res_ok is not None and not res_ok.empty:
-                    st.dataframe(res_ok, use_container_width=True)
-                if include_near and res_near is not None and not res_near.empty:
-                    st.dataframe(res_near, use_container_width=True)
-                if explain_drops and (res_explain is not None) and (not res_explain.empty):
-                    st.dataframe(res_explain, use_container_width=True)
-        with c2:
-            if st.button("🗑️ Clear Last Screener Results", key="del_last_screener"):
-                delete_watchlist("Last Screener Results")
-                st.rerun()
-
-        st.markdown("---")
-
-    # --- Show all other saved watchlists ---
-    for name, syms in st.session_state.saved_watchlists.items():
-        if name == "Last Screener Results":
-            continue
-        st.markdown(f"**{name}** — {len(syms)} symbols")
-        st.write(", ".join(syms))
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button(f"📊 Re-scan {name}", key=f"rescan_{name}"):
-                res_ok, res_near, res_explain = scan_list(
-                    syms, years_back, price_min, price_max, liq_min,
-                    strictness_label=strictness, min_rs_slope=min_rs_slope, include_near=include_near,
-                    near_miss_bps=near_miss_bps, explain=explain_drops
-                )
-                st.subheader(f"Re-scan — {name}")
-                if res_ok is not None and not res_ok.empty:
-                    st.dataframe(res_ok, use_container_width=True)
-                if include_near and res_near is not None and not res_near.empty:
-                    st.dataframe(res_near, use_container_width=True)
-                if explain_drops and (res_explain is not None) and (not res_explain.empty):
-                    st.dataframe(res_explain, use_container_width=True)
-        with c2:
-            buf = io.BytesIO(pd.DataFrame({"Ticker": syms}).to_csv(index=False).encode("utf-8"))
-            st.download_button("⬇️ Export CSV", buf, file_name=f"{name}.csv", key=f"dl_{name}")
-        with c3:
-            if st.button("🗑️ Delete", key=f"del_{name}"):
-                delete_watchlist(name)
-                st.rerun()
-
-    st.markdown("---")
-    st.download_button(
-        "⬇️ Download Saved Screener Results (JSON)",
-        data=export_watchlists_json(),
-        file_name="watchlists.json",
-        mime="application/json",
-        key="dl_saved_json"
-    )
-# =========================
-# Part 3 — Analysis modules
-# =========================
-
-import math, re, io, os
-import requests
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import yfinance as yf
-import streamlit as st
-import feedparser
-from datetime import date, timedelta
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from sklearn.linear_model import LinearRegression
-
-# -----------------------------------------
-# Helpers: Indicators (MACD, RSI, MAs, etc.)
-# -----------------------------------------
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False, min_periods=span).mean()
-
-def _sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window).mean()
-
-def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(length).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(length).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def _macd(close: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = _ema(close, fast)
-    ema_slow = _ema(close, slow)
-    macd = ema_fast - ema_slow
-    signal_line = _ema(macd, signal)
-    hist = macd - signal_line
-    return macd, signal_line, hist
-
-def ensure_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add common indicators to df if missing. Returns a new df."""
-    out = df.copy()
-    if "Close" not in out.columns:
-        return out
-    if "SMA20" not in out.columns:
-        out["SMA20"] = _sma(out["Close"], 20)
-    if "SMA50" not in out.columns:
-        out["SMA50"] = _sma(out["Close"], 50)
-    if "EMA20" not in out.columns:
-        out["EMA20"] = _ema(out["Close"], 20)
-    if "EMA50" not in out.columns:
-        out["EMA50"] = _ema(out["Close"], 50)
-    # MACD
-    if not {"MACD","MACD_signal","MACD_hist"}.issubset(out.columns):
-        macd, sig, hist = _macd(out["Close"])
-        out["MACD"] = macd
-        out["MACD_signal"] = sig
-        out["MACD_hist"] = hist
-    # RSI
-    if "RSI14" not in out.columns:
-        out["RSI14"] = _rsi(out["Close"], 14)
-    # simple example signals (optional)
-    if "buy_signal" not in out.columns:
-        out["buy_signal"] = (out["EMA20"] > out["EMA50"]) & (out["EMA20"].shift(1) <= out["EMA50"].shift(1))
-    if "sell_signal" not in out.columns:
-        out["sell_signal"] = (out["EMA20"] < out["EMA50"]) & (out["EMA20"].shift(1) >= out["EMA50"].shift(1))
-    return out
-
-# ------------------------------------------------
-# Data loader with intraday + resample fallbacks
-# ------------------------------------------------
-_SUPPORTED = {"1h": "60m", "1d": "1d", "1wk": "1wk"}  # native yf intervals
-
-def _download_yf(ticker: str, start: date, end: date, interval: str) -> pd.DataFrame:
-    """Try start/end; if empty, fall back to period-based for intraday."""
-    df = yf.download(
-        ticker, start=start, end=end, interval=interval,
-        auto_adjust=True, progress=False, threads=False
-    )
-    if df is None or df.empty:
-        # Intraday often needs 'period='; try generous periods based on interval
-        period_map = {"60m": "730d", "1d": "10y", "1wk": "20y"}
-        period = period_map.get(interval, "730d")
-        df = yf.download(
-            ticker, period=period, interval=interval,
-            auto_adjust=True, progress=False, threads=False
-        )
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # Normalize columns
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df["Close"] = df["Adj Close"]
-    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-    df = df[keep].copy()
-    for c in keep:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna().sort_index()
-
-def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """Resample 1h data to 2H / 4H OHLC + Volume sum."""
-    o = df["Open"].resample(rule).first()
-    h = df["High"].resample(rule).max()
-    l = df["Low"].resample(rule).min()
-    c = df["Close"].resample(rule).last()
-    v = df["Volume"].resample(rule).sum(min_count=1)
-    out = pd.concat([o.rename("Open"), h.rename("High"), l.rename("Low"),
-                     c.rename("Close"), v.rename("Volume")], axis=1)
-    return out.dropna(how="any")
-
-def get_data_for_timeframe(ticker: str, years: int, timeframe: str) -> pd.DataFrame:
-    """
-    timeframe: one of {'1h','2h','4h','1d','1wk'}.
-    For 2h/4h, fetch 1h then resample.
-    """
-    end = date.today() + timedelta(days=1)
-    start = end - timedelta(days=int(years * 366 + 14))
-
-    tf = timeframe.lower()
-    if tf in ("1h", "1d", "1wk"):
-        base_interval = _SUPPORTED[tf]
-        df = _download_yf(ticker, start, end, base_interval)
-    elif tf in ("2h", "4h"):
-        # fetch base 1h then resample
-        base_interval = _SUPPORTED["1h"]
-        raw = _download_yf(ticker, start, end, base_interval)
-        if raw.empty:
-            df = pd.DataFrame()
+def get_upcoming_earnings(ticker: str):
+    try:
+        tk = yf.Ticker(ticker)
+        dfcal = None
+        for method in ("get_earnings_dates", "earnings_dates"):
+            f = getattr(tk, method, None)
+            if callable(f):
+                try:
+                    dfcal = f(limit=6)
+                    break
+                except Exception:
+                    pass
+        if dfcal is None or len(dfcal)==0:
+            return None, None
+        if isinstance(dfcal.index, pd.DatetimeIndex):
+            next_dt = pd.to_datetime(dfcal.index[0]).date()
         else:
-            rule = "2H" if tf == "2h" else "4H"
-            # ensure DatetimeIndex with timezone removed (yfinance usually tz-aware)
-            raw = raw.tz_localize(None) if raw.index.tz is not None else raw
-            df = _resample_ohlc(raw, rule)
-    else:
-        st.warning(f"Unsupported timeframe '{timeframe}'. Falling back to 1d.")
-        df = _download_yf(ticker, start, end, "1d")
-
-    # Final sanity & tail trim
-    if df is None or df.empty:
-        return pd.DataFrame()
-    return df.tail(int(years * 252) + 120)  # keep enough bars for indicators
-
-# -------------------------
-# Forecast (quick + simple)
-# -------------------------
-def quick_forecast(df: pd.DataFrame, lookback: int = 20):
-    try:
-        s = df["Close"].pct_change().dropna().tail(lookback)
-        if len(s) < 5:
-            return None
-        X = np.arange(len(s)).reshape(-1,1); y = s.values
-        model = LinearRegression().fit(X, y)
-        nxt = float(model.predict(np.array([[len(s)]]))[0])
-        last = float(df["Close"].iloc[-1]); expc = last*(1+nxt)
-        conf = float(min(0.95, max(0.05, abs(model.coef_[0])/(s.std()+1e-9))))
-        return {"direction":"up" if nxt>0 else "down","next_ret":nxt,
-                "last_close":last,"expected_close":float(expc),"confidence":conf}
+            cands = [c for c in dfcal.columns if "earn" in str(c).lower() and "date" in str(c).lower()]
+            if not cands:
+                return None, None
+            next_dt = pd.to_datetime(dfcal[cands[0]].iloc[0]).date()
+        today = date.today()
+        return next_dt, (next_dt - today).days
     except Exception:
-        return None
+        return None, None
 
-# -------------
-# ETA helpers
-# -------------
-def eta_trend_slope_days(df, current_price, target_price, lookback=20):
-    try:
-        if not (np.isfinite(current_price) and np.isfinite(target_price)): return None
-        if current_price <= 0 or target_price <= 0: return None
-        if target_price <= current_price: return None
-        s = pd.Series(df["Close"]).dropna().tail(max(lookback, 10))
-        if len(s) < 10: return None
-        x = np.arange(len(s)).reshape(-1, 1)
-        y = np.log(s.values)
-        lr = LinearRegression().fit(x, y)
-        slope = float(lr.coef_[0])
-        if slope <= 0 or not np.isfinite(slope): return None
-        bars_needed = math.log(target_price / current_price) / slope
-        return float(min(bars_needed, 200.0)) if bars_needed > 0 else None
-    except Exception:
-        return None
-
-def eta_historical_window(df, pct_move: float, lookback_bars=250, max_horizon=60):
-    try:
-        if not np.isfinite(pct_move) or pct_move <= 0: return (None,None,None)
-        s = pd.Series(df["Close"]).dropna()
-        if len(s) < 30: return (None,None,None)
-        s = s.tail(lookback_bars)
-        times = []
-        n = len(s)
-        for i in range(n - 2):
-            base = float(s.iloc[i]); tgt = base*(1.0+pct_move)
-            forward = s.iloc[i+1:min(i+1+max_horizon,n)]
-            hit = np.where(forward.values >= tgt, True, False)
-            if hit.any():
-                times.append(int(np.argmax(hit)+1))
-        if not times: return (None,None,None)
-        arr = np.array(times)
-        return float(np.median(arr)), float(np.percentile(arr,25)), float(np.percentile(arr,75))
-    except Exception:
-        return (None,None,None)
-
-# ------------------------------
-# News / Sentiment (VADER)
-# ------------------------------
 _analyzer = None
 def _get_vader():
     global _analyzer
@@ -861,7 +534,7 @@ def _get_vader():
         _analyzer = SentimentIntensityAnalyzer()
     return _analyzer
 
-def fetch_rss_headlines(ticker: str, limit=12):
+def fetch_rss_headlines(ticker: str, limit: int = 12):
     feeds = [
         f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
         f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en",
@@ -871,217 +544,90 @@ def fetch_rss_headlines(ticker: str, limit=12):
         try:
             d = feedparser.parse(url)
             for e in d.entries[:limit]:
-                title = getattr(e,"title","").strip()
-                link  = getattr(e,"link","")
-                pub   = getattr(e,"published",getattr(e,"updated","")) or ""
+                title = getattr(e, "title", "").strip()
+                link  = getattr(e, "link", "")
+                pub   = getattr(e, "published", getattr(e, "updated", ""))
                 if title:
-                    out.append({"title":title,"link":link,"published":pub})
-            if out: break
+                    out.append({"title": title, "link": link, "published": pub})
+            if out:
+                break
         except Exception:
             continue
     return out[:limit]
 
-def score_headlines_vader(headlines):
+def score_headlines_vader(headlines: list[dict]):
     ana = _get_vader()
     rows = []
     for h in headlines:
         comp = ana.polarity_scores(h["title"])["compound"]
-        if comp >= 0.15: lab="Bullish"
-        elif comp <= -0.15: lab="Bearish"
-        else: lab="Neutral"
-        rows.append({**h,"compound":comp,"label":lab})
+        if comp >= 0.15: lab = "Bullish"
+        elif comp <= -0.15: lab = "Bearish"
+        else: lab = "Neutral"
+        rows.append({**h, "compound": comp, "label": lab})
     if rows:
         df = pd.DataFrame(rows)
         return df, float(df["compound"].mean())
     return pd.DataFrame(columns=["title","link","published","compound","label"]), 0.0
 
-# -------------------------
-# Plot: Candles + MACD/RSI
-# -------------------------
-def plot_candles_macd_rsi(df: pd.DataFrame, ticker: str):
-    """
-    Returns a Figure with 3 stacked rows:
-    (1) Price candles + MAs + Volume bars,
-    (2) MACD + signal + histogram,
-    (3) RSI(14) with 70/30 bands.
-    """
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.55, 0.25, 0.20],
-        vertical_spacing=0.02,
-        specs=[[{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]]
-    )
+# ---------------- Sidebar ----------------
+with st.sidebar:
+    ticker    = st.text_input("Stock ticker (e.g., AAPL, MSFT, TSLA)", "AAPL", key="main_ticker_input")
+    years     = st.slider("Years of history", 1, 10, 3, key="main_years_slider")
+    lookback  = st.slider("Forecast lookback (days)", 5, 60, 20, key="main_lookback_slider")
+    st.caption("Tip: some tickers need suffixes like VOD.L or SHOP.TO.")
 
-    # --- Row 1: Price (candles) + MAs ---
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            name=f"{ticker} OHLC", showlegend=False
-        ),
-        row=1, col=1, secondary_y=False
-    )
+    st.markdown("---")
+    st.subheader("Risk & Plan")
+    account_size  = st.number_input("Account size ($)", min_value=0.0, value=10000.0, step=100.0, key="main_account_size")
+    risk_pct      = st.slider("Risk per trade (%)", 0.1, 5.0, 1.0, step=0.1, key="main_risk_pct")
+    stop_atr_mult = st.slider("Stop distance (x ATR)", 0.5, 5.0, 1.5, step=0.1, key="main_stop_atr_mult")
+    target_rr     = st.slider("Target multiple (R:R)", 0.5, 5.0, 2.0, step=0.5, key="main_target_rr")
+    entry_style   = st.selectbox("Entry style", ["Pullback to EMA20","Breakout 20-day"], key="main_entry_style")
 
-    for name in ["SMA20","SMA50","EMA20","EMA50"]:
-        if name in df.columns:
-            fig.add_trace(go.Scatter(x=df.index, y=df[name], name=name, mode="lines"), row=1, col=1, secondary_y=False)
+    # Watchlist via URL (optional)
+    WATCHLIST_URL = get_secret("WATCHLIST_URL", None)
+    default_wl = ["AAPL","MSFT","NVDA","TSLA","META"]
+    if WATCHLIST_URL:
+        wl_from_url = load_watchlist_from_url(WATCHLIST_URL)
+        if wl_from_url: default_wl = wl_from_url
 
-    # Volume bars (secondary Y on row 1)
-    if "Volume" in df.columns and df["Volume"].notna().any():
-        fig.add_trace(
-            go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.3),
-            row=1, col=1, secondary_y=True
-        )
+    st.markdown("---")
+    st.subheader("Watchlist Screener")
+    wl_input     = st.text_area("Comma-separated tickers", ", ".join(default_wl), height=80, key="main_wl_input")
+    screen_years = st.slider("Screener lookback (years)", 1, 5, 1, key="main_screen_years")
+    run_screen   = st.button("Run Screener", key="btn_run_screen")
 
-    # Buy/Sell markers (if present)
-    buys  = df[df.get("buy_signal", pd.Series(False, index=df.index))]
-    sells = df[df.get("sell_signal", pd.Series(False, index=df.index))]
-    if not buys.empty:
-        fig.add_trace(go.Scatter(
-            x=buys.index, y=buys["Close"], mode="markers",
-            marker_symbol="triangle-up", marker_size=10, name="Buy"
-        ), row=1, col=1)
-    if not sells.empty:
-        fig.add_trace(go.Scatter(
-            x=sells.index, y=sells["Close"], mode="markers",
-            marker_symbol="triangle-down", marker_size=10, name="Sell"
-        ), row=1, col=1)
+    st.markdown("---")
+    st.subheader("Market Scanner (no watchlist)")
+    universe     = st.selectbox("Universe", ["S&P 500","NASDAQ-100"], index=0, key="scan_universe")
+    scan_years   = st.slider("History (years)", 1, 5, 2, key="scan_years")
+    price_min    = st.number_input("Min price ($)", 0.0, value=5.0, step=0.5, key="scan_price_min")
+    price_max    = st.number_input("Max price ($)", 0.0, value=20.0, step=0.5, key="scan_price_max")
+    liq          = st.number_input("Min Avg $ Volume (20d, M)", 0.0, value=2.0, step=0.5, key="scan_min_dollar_vol")
+    setup_mode   = st.radio("Setup type", ["Both","Pullback","Breakout"], horizontal=True, key="scan_mode")
+    strictness   = st.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0, key="scan_strictness")
+    max_symbols  = st.slider("Max symbols to scan", 20, 200, 100, step=10, key="scan_max_symbols")
+    custom_universe = st.text_area("Custom universe (optional, comma tickers)", "", height=60, key="scan_custom_universe")
+    debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
+    run_market_scan = st.button("Scan Market", key="btn_scan_market")
 
-    # --- Row 2: MACD ---
-    if {"MACD","MACD_signal","MACD_hist"}.issubset(df.columns):
-        fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], name="Signal", mode="lines"), row=2, col=1)
-        fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Histogram", opacity=0.5), row=2, col=1)
+    # Local AI toggle
+    default_ai = os.environ.get("ENABLE_LOCAL_AI","false").lower() == "true"
+    AI_ENABLED = st.checkbox("Enable Local AI (Ollama)", value=default_ai,
+                             help="Runs only on your machine with Ollama. Not for Streamlit Cloud.",
+                             key="ai_enable_toggle")
+    if AI_ENABLED:
+        st.subheader("Local AI (Ollama)")
+        defaults  = ["llama3.2:1b","tinyllama:1.1b","qwen2.5:0.5b","llama3.2:3b","phi3:3.8b-mini"]
+        installed = list_ollama_models()
+        choices   = [m for m in defaults if (not installed) or m in installed]
+        model_name = st.selectbox("Model", choices, index=0, key="ai_model_select")
+        if installed: st.caption("Installed: " + ", ".join(installed[:8]) + ("..." if len(installed)>8 else ""))
+        if ollama_available(): st.success("Ollama detected.")
+        else: st.info("Ollama not detected. Install from ollama.com, then: ollama pull llama3.2:1b")
 
-    # --- Row 3: RSI ---
-    if "RSI14" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI(14)", mode="lines"), row=3, col=1)
-        # 70/30 bands
-        fig.add_hline(y=70, line_dash="dot", row=3, col=1)
-        fig.add_hline(y=30, line_dash="dot", row=3, col=1)
-
-    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="MACD", row=2, col=1)
-    fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
-
-    fig.update_layout(
-        height=750,
-        xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"),
-        margin=dict(l=10, r=10, t=30, b=10),
-        hovermode="x unified",
-    )
-    return fig
-
-# --------------------------
-# Single-Ticker UI (Part 3)
-# --------------------------
-st.header("🔍 Single-Ticker Analysis")
-
-ui_a, ui_b, ui_c = st.columns([2,1,1])
-with ui_a:
-    single_ticker = st.text_input("Ticker (e.g., AAPL, MSFT, TSLA)", value="AAPL", key="p3_ticker")
-with ui_b:
-    timeframe = st.selectbox(
-        "Timeframe",
-        options=["1h", "2h", "4h", "1d", "1wk"],
-        index=3,  # default 1d
-        key="p3_timeframe"
-    )
-with ui_c:
-    years_hist = st.slider("Years of history (max fetch)", 1, 10, 3, key="p3_years")
-
-# View range to avoid "entire year" clutter
-vr = st.selectbox(
-    "View Range",
-    options=["Last 1W", "Last 1M", "Last 3M", "Last 6M", "Last 1Y", "All"],
-    index=2,
-    key="p3_view"
-)
-
-cbtn1, cbtn2 = st.columns([1,1])
-with cbtn1:
-    run_analyze = st.button("Analyze", key="p3_btn_analyze")
-with cbtn2:
-    reset_clicked = st.button("Reset", key="p3_btn_reset")
-
-if reset_clicked:
-    st.session_state.pop("p3_ran", None)
-
-if run_analyze:
-    st.session_state["p3_ran"] = True
-
-if st.session_state.get("p3_ran", False):
-    ticker = (single_ticker or "").strip().upper()
-
-    df = get_data_for_timeframe(ticker, years_hist, timeframe)
-    if df.empty or len(df) < 30:
-        st.error("No data found or too little history for this timeframe. Try another ticker, a different timeframe, or more years.")
-    else:
-        # Trim to view range (approx by days)
-        if vr != "All":
-            days_map = {
-                "Last 1W": 7,
-                "Last 1M": 31,
-                "Last 3M": 93,
-                "Last 6M": 186,
-                "Last 1Y": 366,
-            }
-            days = days_map.get(vr, None)
-            if days is not None:
-                cutoff = df.index.max() - pd.Timedelta(days=days)
-                df = df[df.index >= cutoff]
-                # if nothing after trimming (e.g., weekly bars), fall back gracefully
-                if len(df) < 10:
-                    df = get_data_for_timeframe(ticker, max(years_hist, 2), timeframe)
-
-        # Indicators (RSI/MACD/MAs/signals)
-        df = ensure_indicators(df)
-
-        st.caption(f"Data source: Yahoo Finance | Last bar: {pd.to_datetime(df.index[-1]).strftime('%Y-%m-%d %H:%M')} | Timeframe: {timeframe}")
-
-        # Chart
-        st.subheader(f"{ticker} — Candles · MACD · RSI")
-        st.plotly_chart(plot_candles_macd_rsi(df, ticker), use_container_width=True)
-
-        # Quick Forecast (simple)
-        fc = quick_forecast(df, lookback=20)
-        if fc:
-            colf1, colf2, colf3, colf4 = st.columns(4)
-            with colf1:
-                st.metric("Forecast Direction (next bar)", "▲ Up" if fc["direction"]=="up" else "▼ Down")
-            with colf2:
-                st.metric("Last Close", f"${fc['last_close']:.2f}")
-            with colf3:
-                st.metric("Expected Next Close", f"${fc['expected_close']:.2f}")
-            with colf4:
-                st.metric("Confidence (rough)", f"{fc['confidence']*100:.0f}%")
-
-        # Headlines + sentiment
-        st.subheader("📰 Headlines & Sentiment (VADER)")
-        heads = fetch_rss_headlines(ticker, limit=12)
-        hdf, avg_comp = score_headlines_vader(heads)
-        st.caption(f"Average sentiment: {avg_comp:+.2f} (−1 to +1)")
-        if not hdf.empty:
-            for _, r in hdf.iterrows():
-                st.markdown(f"- [{r['title']}]({r['link']}) — *{r['label']}*  \n  <small>{r['published']}</small>", unsafe_allow_html=True)
-        else:
-            st.info("No recent headlines were found for this ticker.")
-
-        # (Optional) ETA sample usage (you can wire this into your Trade Plan UI as needed)
-        with st.expander("⏱️ Time-to-Target (example calc)"):
-            last_close = float(df["Close"].iloc[-1])
-            hypothetical_target = last_close * 1.05  # +5%
-            bars_needed = eta_trend_slope_days(df, last_close, hypothetical_target, lookback=20)
-            med, p25, p75 = eta_historical_window(df, pct_move=0.05, lookback_bars=250, max_horizon=60)
-            col_eta1, col_eta2 = st.columns(2)
-            with col_eta1:
-                st.markdown(f"**Trend-slope ETA to +5%:** {('~' + str(int(round(bars_needed)))) if bars_needed else 'n/a'} bars")
-            with col_eta2:
-                if med:
-                    st.markdown(f"**Historical ETA for +5%:** median {int(med)} bars (IQR {int(p25)}–{int(p75)})")
-                else:
-                    st.markdown("**Historical ETA for +5%:** n/a")
-
-# End Part 3
-
+# ---------------- Top Buttons ----------------
+if st.button("Analyze", key="btn_analyze"):
+    st.session_state.ran = True
+st.button("New analysis (reset)", key="btn_reset",
+          on_click=lambda: st.session_state.update(ran=False, last_ai="", last_ai_ts=0.0))
