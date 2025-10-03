@@ -647,296 +647,174 @@ if st.session_state.saved_watchlists:
         key="dl_saved_json"
     )
 # =========================
-# =========================
-# =========================
-# Part 3/3 — Analysis modules (single ticker) — DROP-IN with 1H/2H/4H/1D/1W
+# Part 3 — Analysis modules
 # =========================
 
-# --- Safe optional imports (Analyzer keeps rendering even if these are missing) ---
-HAVE_FEEDPARSER = True
-HAVE_VADER = True
-HAVE_SKLEARN = True
-
-try:
-    import requests  # typically present
-except Exception:
-    requests = None
-
-try:
-    import feedparser
-except Exception:
-    HAVE_FEEDPARSER = False
-
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-except Exception:
-    HAVE_VADER = False
-    SentimentIntensityAnalyzer = None
-
-try:
-    from sklearn.linear_model import LinearRegression
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import accuracy_score
-except Exception:
-    HAVE_SKLEARN = False
-    # Tiny fallback for quick_forecast()/ETA if sklearn isn't installed.
-    class LinearRegression:
-        def fit(self, X, y):
-            import numpy as _np
-            X = _np.asarray(X).ravel(); y = _np.asarray(y).ravel()
-            if len(X) < 2:
-                self.coef_ = _np.array([0.0]); self.intercept_ = float(y[-1]) if len(y) else 0.0; return self
-            A = _np.c_[X, _np.ones_like(X)]
-            beta, *_ = _np.linalg.lstsq(A, y, rcond=None)
-            self.coef_ = _np.array([beta[0]]); self.intercept_ = beta[1]; return self
-        def predict(self, X):
-            import numpy as _np
-            X = _np.asarray(X).ravel(); return self.coef_[0]*X + self.intercept_
-    def train_test_split(*a, **k): return ([], [], [], [])
-    def accuracy_score(a, b): return 0.0
-    class RandomForestClassifier:
-        def __init__(self, *a, **k): pass
-        def fit(self, X, y): return self
-        def predict(self, X): return [0]*len(X)
-        def predict_proba(self, X):
-            import numpy as _np
-            return _np.c_[[[0.5,0.5]]*len(X)]
-        @property
-        def feature_importances_(self):
-            return []
-
-# Plotting & data libs (re-import safe)
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import math, re, io, os
+import requests
 import numpy as np
 import pandas as pd
-import math
-import datetime as dt
-from datetime import date
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import yfinance as yf
 import streamlit as st
+import feedparser
+from datetime import date, timedelta
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.linear_model import LinearRegression
 
-# yfinance is already imported in Part 1; import again if running standalone
-try:
-    import yfinance as yf  # noqa
-except Exception:
-    pass
+# -----------------------------------------
+# Helpers: Indicators (MACD, RSI, MAs, etc.)
+# -----------------------------------------
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
-# ---------- Range helper ----------
-def slice_df_by_view(df: pd.DataFrame, view: str) -> pd.DataFrame:
-    """Return a sliced DataFrame by time window (1W/1M/3M/6M/YTD/1Y/All)."""
-    if df.empty:
-        return df
-    idx = pd.DatetimeIndex(df.index)
-    end = idx.max()
-    v = (view or "All").upper()
+def _sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
 
-    if v == "ALL":
-        return df
-    if v == "YTD":
-        start = pd.Timestamp(year=end.year, month=1, day=1)
-    elif v == "1W":
-        start = end - pd.Timedelta(days=7)
-    elif v == "1M":
-        start = end - pd.Timedelta(days=31)
-    elif v == "3M":
-        start = end - pd.Timedelta(days=92)
-    elif v == "6M":
-        start = end - pd.Timedelta(days=183)
-    elif v == "1Y":
-        start = end - pd.Timedelta(days=366)
-    else:
-        return df
+def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(length).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(length).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-    out = df.loc[(idx >= start) & (idx <= end)]
-    # If too few rows for indicators to look reasonable, show at least last 60 bars
-    return out if len(out) >= 25 else df.tail(60)
+def _macd(close: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = _ema(close, fast)
+    ema_slow = _ema(close, slow)
+    macd = ema_fast - ema_slow
+    signal_line = _ema(macd, signal)
+    hist = macd - signal_line
+    return macd, signal_line, hist
 
-# ---------- Intraday fetch (1H) with resampling to 2H / 4H ----------
-@st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_intraday_1h(ticker: str, period: str = "180d") -> pd.DataFrame:
-    """
-    Fetch 1-hour bars via yfinance, then normalize (OHLCV, tz-naive, sorted).
-    Yahoo supports 1h (and legacy 60m); period ~180d is usually safe.
-    """
-    t = (ticker or "").strip().upper()
-    if not t:
-        return pd.DataFrame()
-    df = pd.DataFrame()
-    try:
-        df = yf.download(t, period=period, interval="1h", auto_adjust=True, progress=False, threads=False)
-        if df is None or df.empty:
-            df = yf.download(t, period=period, interval="60m", auto_adjust=True, progress=False, threads=False)
-    except Exception:
-        df = pd.DataFrame()
+def ensure_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add common indicators to df if missing. Returns a new df."""
+    out = df.copy()
+    if "Close" not in out.columns:
+        return out
+    if "SMA20" not in out.columns:
+        out["SMA20"] = _sma(out["Close"], 20)
+    if "SMA50" not in out.columns:
+        out["SMA50"] = _sma(out["Close"], 50)
+    if "EMA20" not in out.columns:
+        out["EMA20"] = _ema(out["Close"], 20)
+    if "EMA50" not in out.columns:
+        out["EMA50"] = _ema(out["Close"], 50)
+    # MACD
+    if not {"MACD","MACD_signal","MACD_hist"}.issubset(out.columns):
+        macd, sig, hist = _macd(out["Close"])
+        out["MACD"] = macd
+        out["MACD_signal"] = sig
+        out["MACD_hist"] = hist
+    # RSI
+    if "RSI14" not in out.columns:
+        out["RSI14"] = _rsi(out["Close"], 14)
+    # simple example signals (optional)
+    if "buy_signal" not in out.columns:
+        out["buy_signal"] = (out["EMA20"] > out["EMA50"]) & (out["EMA20"].shift(1) <= out["EMA50"].shift(1))
+    if "sell_signal" not in out.columns:
+        out["sell_signal"] = (out["EMA20"] < out["EMA50"]) & (out["EMA20"].shift(1) >= out["EMA50"].shift(1))
+    return out
+
+# ------------------------------------------------
+# Data loader with intraday + resample fallbacks
+# ------------------------------------------------
+_SUPPORTED = {"1h": "60m", "1d": "1d", "1wk": "1wk"}  # native yf intervals
+
+def _download_yf(ticker: str, start: date, end: date, interval: str) -> pd.DataFrame:
+    """Try start/end; if empty, fall back to period-based for intraday."""
+    df = yf.download(
+        ticker, start=start, end=end, interval=interval,
+        auto_adjust=True, progress=False, threads=False
+    )
+    if df is None or df.empty:
+        # Intraday often needs 'period='; try generous periods based on interval
+        period_map = {"60m": "730d", "1d": "10y", "1wk": "20y"}
+        period = period_map.get(interval, "730d")
+        df = yf.download(
+            ticker, period=period, interval=interval,
+            auto_adjust=True, progress=False, threads=False
+        )
     if df is None or df.empty:
         return pd.DataFrame()
 
+    # Normalize columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df["Close"] = df["Adj Close"]
     keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-    df = df[keep].copy().dropna()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, errors="coerce")
-    tz = getattr(df.index, "tz", None)
-    if tz is not None:
-        df.index = df.index.tz_convert(None)
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-    df.attrs["source"] = "yahoo:download(intraday 1h)"
-    return df
+    df = df[keep].copy()
+    for c in keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna().sort_index()
 
 def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """Resample OHLCV to a new rule (e.g., '2H','4H','W-FRI')."""
-    if df.empty:
-        return df
-    agg = {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}
-    out = df.resample(rule, label="right", closed="right").agg(agg).dropna()
-    return out
+    """Resample 1h data to 2H / 4H OHLC + Volume sum."""
+    o = df["Open"].resample(rule).first()
+    h = df["High"].resample(rule).max()
+    l = df["Low"].resample(rule).min()
+    c = df["Close"].resample(rule).last()
+    v = df["Volume"].resample(rule).sum(min_count=1)
+    out = pd.concat([o.rename("Open"), h.rename("High"), l.rename("Low"),
+                     c.rename("Close"), v.rename("Volume")], axis=1)
+    return out.dropna(how="any")
 
-def _build_indicators_safe(df: pd.DataFrame) -> pd.DataFrame:
-    """Use build_indicators with a tiny guard for small frames."""
-    if df is None or df.empty or len(df) < 5:
+def get_data_for_timeframe(ticker: str, years: int, timeframe: str) -> pd.DataFrame:
+    """
+    timeframe: one of {'1h','2h','4h','1d','1wk'}.
+    For 2h/4h, fetch 1h then resample.
+    """
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=int(years * 366 + 14))
+
+    tf = timeframe.lower()
+    if tf in ("1h", "1d", "1wk"):
+        base_interval = _SUPPORTED[tf]
+        df = _download_yf(ticker, start, end, base_interval)
+    elif tf in ("2h", "4h"):
+        # fetch base 1h then resample
+        base_interval = _SUPPORTED["1h"]
+        raw = _download_yf(ticker, start, end, base_interval)
+        if raw.empty:
+            df = pd.DataFrame()
+        else:
+            rule = "2H" if tf == "2h" else "4H"
+            # ensure DatetimeIndex with timezone removed (yfinance usually tz-aware)
+            raw = raw.tz_localize(None) if raw.index.tz is not None else raw
+            df = _resample_ohlc(raw, rule)
+    else:
+        st.warning(f"Unsupported timeframe '{timeframe}'. Falling back to 1d.")
+        df = _download_yf(ticker, start, end, "1d")
+
+    # Final sanity & tail trim
+    if df is None or df.empty:
         return pd.DataFrame()
-    try:
-        return build_indicators(df)
-    except Exception:
-        return pd.DataFrame()
+    return df.tail(int(years * 252) + 120)  # keep enough bars for indicators
 
-def get_data_for_timeframe(ticker: str, years_hist: int, tf: str) -> pd.DataFrame:
-    """
-    Return OHLCV + indicators at selected timeframe:
-    - 1H: fetch 1-hour from Yahoo
-    - 2H/4H: fetch 1-hour then resample
-    - 1D: use daily loader
-    - 1W: daily -> weekly resample (W-FRI)
-    """
-    tf = (tf or "1D").upper()
-    if tf in ("1H","2H","4H"):
-        base = _fetch_intraday_1h(ticker, period="180d")
-        if base.empty:
-            return pd.DataFrame()
-        if tf == "2H":
-            base = _resample_ohlc(base, "2H")
-        elif tf == "4H":
-            base = _resample_ohlc(base, "4H")
-        return _build_indicators_safe(base)
-
-    # Daily / Weekly
-    daily = load_data(ticker, years_hist)
-    if daily.empty:
-        return pd.DataFrame()
-    if tf == "1W":
-        wk = _resample_ohlc(daily, "W-FRI")
-        wk.attrs["source"] = daily.attrs.get("source","") + " -> weekly"
-        return _build_indicators_safe(wk)
-    # 1D default
-    return _build_indicators_safe(daily)
-
-# ---------- Plot: Candles + MACD + RSI with range tools ----------
-def plot_price(df: pd.DataFrame):
-    """
-    Candles + EMA20/EMA50 on top, MACD (line+signal+hist) mid,
-    RSI(14) with 30/50/70 guides bottom. Includes rangeselector & rangeslider.
-    """
-    ema20 = df.get("EMA20"); ema50 = df.get("EMA50")
-    macd_line = df.get("MACD"); macd_sig = df.get("MACDsig")
-    macd_hist = (macd_line - macd_sig) if (macd_line is not None and macd_sig is not None) else None
-    rsi14 = df.get("RSI14")
-
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-        row_heights=[0.62, 0.19, 0.19],
-        specs=[[{}], [{}], [{}]]
-    )
-
-    # Row 1: Price
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price"
-    ), row=1, col=1)
-
-    if "EMA20" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=ema20, name="EMA20", mode="lines"), row=1, col=1)
-    if "EMA50" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA50", mode="lines"), row=1, col=1)
-
-    # Optional markers
-    buys  = df[df.get("buy_signal", pd.Series(False, index=df.index))]
-    sells = df[df.get("sell_signal", pd.Series(False, index=df.index))]
-    if not buys.empty:
-        fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], name="Buy",
-                                 mode="markers", marker_symbol="triangle-up", marker_size=10), row=1, col=1)
-    if not sells.empty:
-        fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], name="Sell",
-                                 mode="markers", marker_symbol="triangle-down", marker_size=10), row=1, col=1)
-
-    # Row 2: MACD
-    if (macd_line is not None) and (macd_sig is not None):
-        if macd_hist is not None:
-            colors = np.where(macd_hist >= 0, "rgba(38,166,154,0.6)", "rgba(239,83,80,0.6)")
-            fig.add_trace(go.Bar(x=df.index, y=macd_hist, name="MACD hist", marker_color=colors), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=macd_line, name="MACD", mode="lines"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=macd_sig,  name="Signal", mode="lines", line=dict(dash="dot")), row=2, col=1)
-        # zero line
-        fig.add_shape(type="line", x0=df.index.min(), x1=df.index.max(), y0=0, y1=0,
-                      line=dict(width=1, dash="dot"), xref="x2", yref="y2")
-
-    # Row 3: RSI
-    if rsi14 is not None:
-        fig.add_trace(go.Scatter(x=df.index, y=rsi14, name="RSI(14)", mode="lines"), row=3, col=1)
-        fig.add_shape(type="rect", xref="x3", yref="y3",
-                      x0=df.index.min(), x1=df.index.max(), y0=30, y1=70,
-                      fillcolor="rgba(180,180,180,0.15)", line_width=0)
-        for yv, dsh in [(30, "dot"), (50, "dot"), (70, "dot")]:
-            fig.add_shape(type="line", x0=df.index.min(), x1=df.index.max(), y0=yv, y1=yv,
-                          line=dict(width=1, dash=dsh), xref="x3", yref="y3")
-
-    # Range buttons + slider (top pane x-axis)
-    fig.update_xaxes(
-        rangeselector=dict(
-            buttons=list([
-                dict(count=7, label="1W", step="day",   stepmode="backward"),
-                dict(count=1, label="1M", step="month", stepmode="backward"),
-                dict(count=3, label="3M", step="month", stepmode="backward"),
-                dict(count=6, label="6M", step="month", stepmode="backward"),
-                dict(count=1, label="YTD",step="year",  stepmode="todate"),
-                dict(count=1, label="1Y", step="year",  stepmode="backward"),
-                dict(step="all")
-            ])
-        ),
-        rangeslider=dict(visible=True),
-        type="date",
-        row=1, col=1
-    )
-
-    # Axes + layout
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="MACD",  row=2, col=1)
-    fig.update_yaxes(title_text="RSI",   row=3, col=1, range=[0, 100])
-    fig.update_layout(
-        height=840,
-        template="plotly_white",
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"),
-        margin=dict(l=10, r=10, t=30, b=10)
-    )
-    return fig
-
-# ---------- Quick forecast (tiny) ----------
+# -------------------------
+# Forecast (quick + simple)
+# -------------------------
 def quick_forecast(df: pd.DataFrame, lookback: int = 20):
-    s = df["Close"].pct_change().dropna().tail(lookback)
-    if len(s) < 5:
+    try:
+        s = df["Close"].pct_change().dropna().tail(lookback)
+        if len(s) < 5:
+            return None
+        X = np.arange(len(s)).reshape(-1,1); y = s.values
+        model = LinearRegression().fit(X, y)
+        nxt = float(model.predict(np.array([[len(s)]]))[0])
+        last = float(df["Close"].iloc[-1]); expc = last*(1+nxt)
+        conf = float(min(0.95, max(0.05, abs(model.coef_[0])/(s.std()+1e-9))))
+        return {"direction":"up" if nxt>0 else "down","next_ret":nxt,
+                "last_close":last,"expected_close":float(expc),"confidence":conf}
+    except Exception:
         return None
-    X = np.arange(len(s)).reshape(-1,1); y = s.values
-    model = LinearRegression().fit(X, y)
-    nxt = float(np.asarray(model.predict(np.array([[len(s)]]))).ravel()[0])
-    last = float(df["Close"].iloc[-1]); expc = last*(1+nxt)
-    # confidence-ish: slope / volatility (capped)
-    coef0 = getattr(model, "coef_", [0])[0] if hasattr(model, "coef_") else 0.0
-    conf = float(min(0.95, max(0.05, abs(coef0)/(s.std()+1e-9))))
-    return {"direction":"up" if nxt>0 else "down","next_ret":nxt,"last_close":last,"expected_close":float(expc),"confidence":conf}
 
-# ---------- ETA helpers ----------
-def eta_trend_slope_days(df: pd.DataFrame, current_price: float, target_price: float, lookback: int = 20) -> float | None:
+# -------------
+# ETA helpers
+# -------------
+def eta_trend_slope_days(df, current_price, target_price, lookback=20):
     try:
         if not (np.isfinite(current_price) and np.isfinite(target_price)): return None
         if current_price <= 0 or target_price <= 0: return None
@@ -946,143 +824,44 @@ def eta_trend_slope_days(df: pd.DataFrame, current_price: float, target_price: f
         x = np.arange(len(s)).reshape(-1, 1)
         y = np.log(s.values)
         lr = LinearRegression().fit(x, y)
-        slope = float(getattr(lr, "coef_", [0])[0]) if hasattr(lr, "coef_") else 0.0
+        slope = float(lr.coef_[0])
         if slope <= 0 or not np.isfinite(slope): return None
         bars_needed = math.log(target_price / current_price) / slope
-        if bars_needed <= 0 or not np.isfinite(bars_needed): return None
-        return float(min(bars_needed, 200.0))
+        return float(min(bars_needed, 200.0)) if bars_needed > 0 else None
     except Exception:
         return None
 
-def eta_historical_window(df: pd.DataFrame, pct_move: float, lookback_bars: int = 250, max_horizon: int = 60):
+def eta_historical_window(df, pct_move: float, lookback_bars=250, max_horizon=60):
     try:
-        if not np.isfinite(pct_move) or pct_move <= 0: return (None, None, None)
+        if not np.isfinite(pct_move) or pct_move <= 0: return (None,None,None)
         s = pd.Series(df["Close"]).dropna()
-        if len(s) < 30: return (None, None, None)
+        if len(s) < 30: return (None,None,None)
         s = s.tail(lookback_bars)
         times = []
         n = len(s)
         for i in range(n - 2):
-            base = float(s.iloc[i])
-            tgt = base * (1.0 + pct_move)
-            forward = s.iloc[i+1 : min(i+1+max_horizon, n)]
+            base = float(s.iloc[i]); tgt = base*(1.0+pct_move)
+            forward = s.iloc[i+1:min(i+1+max_horizon,n)]
             hit = np.where(forward.values >= tgt, True, False)
             if hit.any():
-                days = int(np.argmax(hit) + 1)
-                times.append(days)
-        if not times:
-            return (None, None, None)
+                times.append(int(np.argmax(hit)+1))
+        if not times: return (None,None,None)
         arr = np.array(times)
-        med = float(np.median(arr)); q1 = float(np.percentile(arr, 25)); q3 = float(np.percentile(arr, 75))
-        return (med, q1, q3)
+        return float(np.median(arr)), float(np.percentile(arr,25)), float(np.percentile(arr,75))
     except Exception:
-        return (None, None, None)
+        return (None,None,None)
 
-# ---------- Trade planning ----------
-def plan_trade(latest_row: pd.Series, trend_up: bool, atr_val: float, hh20: float, ll20: float,
-               ema20: float, close: float, account_size: float, risk_pct: float,
-               stop_atr_mult: float, target_rr: float, entry_style: str):
-    risk_d = max(0.0, account_size*(risk_pct/100.0))
-    if entry_style == "Pullback to EMA20":
-        entry = float(ema20)
-        if trend_up:
-            stop = entry - stop_atr_mult*atr_val; target = entry + target_rr*(entry - stop)
-        else:
-            stop = entry + stop_atr_mult*atr_val; target = entry - target_rr*(stop - entry)
-    else:
-        if trend_up:
-            entry = float(max(close, hh20)); stop = entry - stop_atr_mult*atr_val; target = entry + target_rr*(entry - stop)
-        else:
-            entry = float(min(close, ll20)); stop = entry + stop_atr_mult*atr_val; target = entry - target_rr*(stop - entry)
-    sd = abs(entry - stop)
-    shares = int(math.floor(risk_d/sd)) if (sd > 0 and risk_d > 0) else 0
-    notional = shares * entry
-    rr = (abs(target - entry)/sd) if sd > 0 else np.nan
-    reward_d = abs(target - entry) * shares
-    return {"entry":entry,"stop":stop,"target":target,"shares":shares,"risk_dollars":risk_d,"reward_dollars":reward_d,"notional":notional,"rr":rr}
-
-def make_order_ticket(ticker: str, side_long: bool, entry_style: str, entry: float, stop: float, target: float,
-                      shares: int, rr: float, atr_val: float, risk_dollars: float, reward_dollars: float):
-    bias = "LONG" if side_long else "SHORT"
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = [
-        f"Order Ticket - {now}",
-        f"Ticker: {ticker.upper()}",
-        f"Bias: {bias}",
-        f"Entry style: {entry_style}",
-        f"Entry: {entry:,.2f}",
-        f"Stop: {stop:,.2f}",
-        f"Target: {target:,.2f}",
-        f"Shares: {shares:,}",
-        f"Risk $: {risk_dollars:,.2f}",
-        f"Est. Reward $: {reward_dollars:,.2f}",
-        f"Approx R:R: {rr:.2f}" if (isinstance(rr, (int,float)) and np.isfinite(rr)) else "Approx R:R: n/a",
-        f"ATR(14): {atr_val:,.2f}",
-        "Notes: Use a bracket order (entry + stop + limit)."
-    ]
-    text = "\n".join(lines)
-    payload = {
-        "timestamp": now, "ticker": ticker.upper(), "bias": bias,
-        "entry_style": entry_style, "entry": round(entry, 4), "stop": round(stop, 4),
-        "target": round(target, 4), "shares": int(shares),
-        "risk_dollars": round(risk_dollars, 2), "reward_dollars": round(reward_dollars, 2),
-        "rr": round(rr, 3) if (isinstance(rr, (int,float)) and np.isfinite(rr)) else None, "atr14": round(atr_val, 4)
-    }
-    json_bytes = io.BytesIO(json.dumps(payload, indent=2).encode("utf-8"))
-    csv_bytes  = io.BytesIO(pd.DataFrame([payload]).to_csv(index=False).encode("utf-8"))
-    txt_bytes  = io.BytesIO(text.encode("utf-8"))
-    return text, json_bytes, csv_bytes, txt_bytes
-
-def explain_plan(ticker, trend_up, entry_style, entry, stop, target, rsi_val, atr, ema20, ema50, hh20, ll20):
-    bias = "long" if trend_up else "short"
-    lines = [
-        f"{ticker.upper()} - Plan rationale",
-        f"- Bias: {bias} (EMA20 {'>' if trend_up else '<'} EMA50)",
-        f"- Entry style: {entry_style} at ~{entry:,.2f}",
-        f"- Stop uses ATR ({atr:,.2f}) -> stop ~{stop:,.2f}",
-        f"- Target via R multiple -> ~{target:,.2f}",
-        f"- Trend context: EMA20 {ema20:,.2f}, EMA50 {ema50:,.2f}"
-    ]
-    if pd.notna(hh20) and pd.notna(ll20):
-        lines.append(f"- Recent 20-bar range: {ll20:,.2f} -> {hh20:,.2f}")
-    if pd.notna(rsi_val):
-        if rsi_val < 40: lines.append("- RSI < 40 -> weak momentum; be conservative.")
-        elif rsi_val > 60: lines.append("- RSI > 60 -> firm momentum; breakouts may follow through.")
-        else: lines.append("- RSI ~ 40-60 -> neutral; expect chop.")
-    return "\n".join(lines)
-
-# ---------- Seasonality ----------
-def _prep_series_for_ts(df: pd.DataFrame) -> pd.Series:
-    s = df["Close"].copy()
-    s.index = pd.DatetimeIndex(s.index)
-    return s.asfreq("B").ffill()
-
-def seasonality_tables(df: pd.DataFrame):
-    s = _prep_series_for_ts(df)
-    ret_next = s.pct_change().shift(-1)
-    dfw = pd.DataFrame({"ret_next": ret_next})
-    dfw["dow"] = dfw.index.dayofweek
-    dfw["mon"] = dfw.index.month
-
-    dow_tbl = dfw.groupby("dow")["ret_next"].mean().reindex([0,1,2,3,4]).to_frame("avg_next_ret").dropna()
-    dow_tbl.index = ["Mon","Tue","Wed","Thu","Fri"]
-
-    mon_order = list(range(1,13))
-    mon_tbl = dfw.groupby("mon")["ret_next"].mean().reindex(mon_order).to_frame("avg_next_ret").dropna()
-    mon_tbl.index = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    return dow_tbl, mon_tbl
-
-# ---------- Headlines + Sentiment ----------
+# ------------------------------
+# News / Sentiment (VADER)
+# ------------------------------
 _analyzer = None
 def _get_vader():
     global _analyzer
-    if _analyzer is None and HAVE_VADER:
+    if _analyzer is None:
         _analyzer = SentimentIntensityAnalyzer()
     return _analyzer
 
-def fetch_rss_headlines(ticker: str, limit: int = 12):
-    if not HAVE_FEEDPARSER:
-        return []
+def fetch_rss_headlines(ticker: str, limit=12):
     feeds = [
         f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
         f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en",
@@ -1092,270 +871,217 @@ def fetch_rss_headlines(ticker: str, limit: int = 12):
         try:
             d = feedparser.parse(url)
             for e in d.entries[:limit]:
-                title = getattr(e, "title", "").strip()
-                link  = getattr(e, "link", "")
-                pub   = getattr(e, "published", getattr(e, "updated", "")) or ""
+                title = getattr(e,"title","").strip()
+                link  = getattr(e,"link","")
+                pub   = getattr(e,"published",getattr(e,"updated","")) or ""
                 if title:
-                    out.append({"title": title, "link": link, "published": pub})
-            if out:
-                break
+                    out.append({"title":title,"link":link,"published":pub})
+            if out: break
         except Exception:
             continue
     return out[:limit]
 
-def score_headlines_vader(headlines: list[dict]):
-    if not HAVE_VADER:
-        return pd.DataFrame(columns=["title","link","published","compound","label"]), 0.0
+def score_headlines_vader(headlines):
     ana = _get_vader()
     rows = []
     for h in headlines:
         comp = ana.polarity_scores(h["title"])["compound"]
-        if comp >= 0.15: lab = "Bullish"
-        elif comp <= -0.15: lab = "Bearish"
-        else: lab = "Neutral"
-        rows.append({**h, "compound": comp, "label": lab})
+        if comp >= 0.15: lab="Bullish"
+        elif comp <= -0.15: lab="Bearish"
+        else: lab="Neutral"
+        rows.append({**h,"compound":comp,"label":lab})
     if rows:
         df = pd.DataFrame(rows)
         return df, float(df["compound"].mean())
     return pd.DataFrame(columns=["title","link","published","compound","label"]), 0.0
 
-# =========================
-# Single-Ticker UI + analyses
-# =========================
+# -------------------------
+# Plot: Candles + MACD/RSI
+# -------------------------
+def plot_candles_macd_rsi(df: pd.DataFrame, ticker: str):
+    """
+    Returns a Figure with 3 stacked rows:
+    (1) Price candles + MAs + Volume bars,
+    (2) MACD + signal + histogram,
+    (3) RSI(14) with 70/30 bands.
+    """
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.55, 0.25, 0.20],
+        vertical_spacing=0.02,
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]]
+    )
+
+    # --- Row 1: Price (candles) + MAs ---
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            name=f"{ticker} OHLC", showlegend=False
+        ),
+        row=1, col=1, secondary_y=False
+    )
+
+    for name in ["SMA20","SMA50","EMA20","EMA50"]:
+        if name in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[name], name=name, mode="lines"), row=1, col=1, secondary_y=False)
+
+    # Volume bars (secondary Y on row 1)
+    if "Volume" in df.columns and df["Volume"].notna().any():
+        fig.add_trace(
+            go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.3),
+            row=1, col=1, secondary_y=True
+        )
+
+    # Buy/Sell markers (if present)
+    buys  = df[df.get("buy_signal", pd.Series(False, index=df.index))]
+    sells = df[df.get("sell_signal", pd.Series(False, index=df.index))]
+    if not buys.empty:
+        fig.add_trace(go.Scatter(
+            x=buys.index, y=buys["Close"], mode="markers",
+            marker_symbol="triangle-up", marker_size=10, name="Buy"
+        ), row=1, col=1)
+    if not sells.empty:
+        fig.add_trace(go.Scatter(
+            x=sells.index, y=sells["Close"], mode="markers",
+            marker_symbol="triangle-down", marker_size=10, name="Sell"
+        ), row=1, col=1)
+
+    # --- Row 2: MACD ---
+    if {"MACD","MACD_signal","MACD_hist"}.issubset(df.columns):
+        fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], name="Signal", mode="lines"), row=2, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Histogram", opacity=0.5), row=2, col=1)
+
+    # --- Row 3: RSI ---
+    if "RSI14" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI(14)", mode="lines"), row=3, col=1)
+        # 70/30 bands
+        fig.add_hline(y=70, line_dash="dot", row=3, col=1)
+        fig.add_hline(y=30, line_dash="dot", row=3, col=1)
+
+    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
+
+    fig.update_layout(
+        height=750,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"),
+        margin=dict(l=10, r=10, t=30, b=10),
+        hovermode="x unified",
+    )
+    return fig
+
+# --------------------------
+# Single-Ticker UI (Part 3)
+# --------------------------
 st.header("🔍 Single-Ticker Analysis")
 
-col_in_a, col_in_b, col_in_c = st.columns([2,1,1])
-with col_in_a:
-    single_ticker = st.text_input("Ticker (e.g., AAPL, MSFT, TSLA)", value="AAPL", key="single_ticker")
-with col_in_b:
-    timeframe = st.selectbox("Timeframe", ["1H","2H","4H","1D","1W"], index=3, key="timeframe")
-with col_in_c:
-    years_hist = st.slider("Years (for 1D/1W)", 1, 10, 3, key="years_hist")
+ui_a, ui_b, ui_c = st.columns([2,1,1])
+with ui_a:
+    single_ticker = st.text_input("Ticker (e.g., AAPL, MSFT, TSLA)", value="AAPL", key="p3_ticker")
+with ui_b:
+    timeframe = st.selectbox(
+        "Timeframe",
+        options=["1h", "2h", "4h", "1d", "1wk"],
+        index=3,  # default 1d
+        key="p3_timeframe"
+    )
+with ui_c:
+    years_hist = st.slider("Years of history (max fetch)", 1, 10, 3, key="p3_years")
 
-# Chart range picker
-view_choice = st.radio(
-    "Chart range", ["1W","1M","3M","6M","YTD","1Y","All"],
-    index=2, horizontal=True, key="chart_range"
+# View range to avoid "entire year" clutter
+vr = st.selectbox(
+    "View Range",
+    options=["Last 1W", "Last 1M", "Last 3M", "Last 6M", "Last 1Y", "All"],
+    index=2,
+    key="p3_view"
 )
-
-if timeframe in ("1H","2H","4H"):
-    st.caption("ℹ️ Intraday uses up to ~180 days of 1-hour data (2H/4H are resampled).")
 
 cbtn1, cbtn2 = st.columns([1,1])
 with cbtn1:
-    run_analyze = st.button("Analyze", key="btn_analyze")
+    run_analyze = st.button("Analyze", key="p3_btn_analyze")
 with cbtn2:
-    st.button("Reset", on_click=lambda: st.session_state.update(ran=False), key="btn_reset")
+    reset_clicked = st.button("Reset", key="p3_btn_reset")
+
+if reset_clicked:
+    st.session_state.pop("p3_ran", None)
 
 if run_analyze:
-    st.session_state.ran = True
+    st.session_state["p3_ran"] = True
 
-if st.session_state.ran:
+if st.session_state.get("p3_ran", False):
     ticker = (single_ticker or "").strip().upper()
-    df_all = get_data_for_timeframe(ticker, years_hist, timeframe)
-    if df_all.empty or len(df_all) < 30:
-        st.error("No data found or too little history for this timeframe. Try another ticker or a longer period.")
+
+    df = get_data_for_timeframe(ticker, years_hist, timeframe)
+    if df.empty or len(df) < 30:
+        st.error("No data found or too little history for this timeframe. Try another ticker, a different timeframe, or more years.")
     else:
-        df_view = slice_df_by_view(df_all, view_choice)
+        # Trim to view range (approx by days)
+        if vr != "All":
+            days_map = {
+                "Last 1W": 7,
+                "Last 1M": 31,
+                "Last 3M": 93,
+                "Last 6M": 186,
+                "Last 1Y": 366,
+            }
+            days = days_map.get(vr, None)
+            if days is not None:
+                cutoff = df.index.max() - pd.Timedelta(days=days)
+                df = df[df.index >= cutoff]
+                # if nothing after trimming (e.g., weekly bars), fall back gracefully
+                if len(df) < 10:
+                    df = get_data_for_timeframe(ticker, max(years_hist, 2), timeframe)
 
-        # Source & last bar date
-        try:
-            src = df_all.attrs.get("source","yahoo")
-            last_ts = pd.to_datetime(df_all.index, errors="coerce").max()
-            last_dt = pd.Timestamp(last_ts).tz_localize(None).to_pydatetime()
-            st.caption(f"Data source: {src} | Timeframe: {timeframe} | Last bar: {last_dt.date()} {last_dt.strftime('%H:%M')}")
-        except Exception:
-            pass
+        # Indicators (RSI/MACD/MAs/signals)
+        df = ensure_indicators(df)
 
-        # Price chart
-        st.subheader(f"{ticker} — {timeframe} Candles, MACD & RSI")
-        st.plotly_chart(plot_price(df_view), use_container_width=True)
+        st.caption(f"Data source: Yahoo Finance | Last bar: {pd.to_datetime(df.index[-1]).strftime('%Y-%m-%d %H:%M')} | Timeframe: {timeframe}")
 
-        latest  = df_all.iloc[-1]
-        trend_up = bool(latest["EMA20"] > latest["EMA50"])
-        side_txt = "long bias" if trend_up else "short bias"
-        atr_val = float(latest["ATR14"]); close = float(latest["Close"])
-        ema20   = float(latest["EMA20"]); ema50 = float(latest["EMA50"])
-        hh20    = float(latest.get("HH20", np.nan)); ll20 = float(latest.get("LL20", np.nan))
+        # Chart
+        st.subheader(f"{ticker} — Candles · MACD · RSI")
+        st.plotly_chart(plot_candles_macd_rsi(df, ticker), use_container_width=True)
 
-        c1,c2,c3 = st.columns(3)
-        c1.metric("Trend", side_txt)
-        c2.metric("ATR(14)", f"{atr_val:,.2f}")
-        c3.metric("Last close", f"{close:,.2f}")
-
-        # Tiny forecast
-        st.subheader("Tiny toy forecast (next bar)")
-        fc = quick_forecast(df_all, lookback=20)
+        # Quick Forecast (simple)
+        fc = quick_forecast(df, lookback=20)
         if fc:
-            d1,d2,d3 = st.columns(3)
-            d1.metric("Direction", "Up" if fc["direction"]=="up" else "Down")
-            d2.metric("Expected close", f"{fc['expected_close']:,.2f}")
-            d3.metric("Confidence-ish", f"{int(fc['confidence']*100)}%")
-            st.caption("Simple momentum estimate. Educational only.")
+            colf1, colf2, colf3, colf4 = st.columns(4)
+            with colf1:
+                st.metric("Forecast Direction (next bar)", "▲ Up" if fc["direction"]=="up" else "▼ Down")
+            with colf2:
+                st.metric("Last Close", f"${fc['last_close']:.2f}")
+            with colf3:
+                st.metric("Expected Next Close", f"${fc['expected_close']:.2f}")
+            with colf4:
+                st.metric("Confidence (rough)", f"{fc['confidence']*100:.0f}%")
+
+        # Headlines + sentiment
+        st.subheader("📰 Headlines & Sentiment (VADER)")
+        heads = fetch_rss_headlines(ticker, limit=12)
+        hdf, avg_comp = score_headlines_vader(heads)
+        st.caption(f"Average sentiment: {avg_comp:+.2f} (−1 to +1)")
+        if not hdf.empty:
+            for _, r in hdf.iterrows():
+                st.markdown(f"- [{r['title']}]({r['link']}) — *{r['label']}*  \n  <small>{r['published']}</small>", unsafe_allow_html=True)
         else:
-            st.info("Not enough data to estimate.")
+            st.info("No recent headlines were found for this ticker.")
 
-        # ML edge (next-bar direction)
-        st.subheader("ML edge (next-bar direction)")
-        try:
-            if HAVE_SKLEARN:
-                X = pd.concat([
-                    pd.Series(df_all["Close"].pct_change(),   name="RET1"),
-                    pd.Series(df_all["Close"].pct_change(5),  name="RET5"),
-                    pd.Series(df_all["Close"].pct_change(10), name="RET10"),
-                    pd.Series((df_all["High"] - df_all["Low"]) / df_all["Close"], name="HL_PCT"),
-                    pd.Series(df_all["ATR14"] / df_all["Close"], name="ATR_PCT"),
-                    df_all[["EMA20","EMA50","SMA20","SMA50","RSI14","MACD","MACDsig"]],
-                ], axis=1)
-
-                X = X.replace([np.inf, -np.inf], np.nan).dropna()
-                y = (df_all["Close"].shift(-1) > df_all["Close"]).astype(int).reindex(X.index)
-
-                if len(X) > 200 and y.notna().sum() > 50:
-                    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, shuffle=False)
-                    clf = RandomForestClassifier(n_estimators=300, max_depth=5, random_state=42, n_jobs=-1)
-                    clf.fit(Xtr, ytr)
-
-                    acc = accuracy_score(yte, clf.predict(Xte))
-                    proba_up = float(clf.predict_proba(X.iloc[[-1]])[0, 1])
-                    imps = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False)
-
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Prob. Up (next bar)", f"{proba_up*100:.1f}%")
-                    m2.metric("Backtest Accuracy*", f"{acc*100:.1f}%")
-                    m3.metric("Top feature", imps.index[0] if len(imps) else "n/a")
-                    with st.expander("Feature importances"):
-                        st.write(imps.to_frame("importance"))
-                    st.caption("*Toy model, simple split. Educational only.")
+        # (Optional) ETA sample usage (you can wire this into your Trade Plan UI as needed)
+        with st.expander("⏱️ Time-to-Target (example calc)"):
+            last_close = float(df["Close"].iloc[-1])
+            hypothetical_target = last_close * 1.05  # +5%
+            bars_needed = eta_trend_slope_days(df, last_close, hypothetical_target, lookback=20)
+            med, p25, p75 = eta_historical_window(df, pct_move=0.05, lookback_bars=250, max_horizon=60)
+            col_eta1, col_eta2 = st.columns(2)
+            with col_eta1:
+                st.markdown(f"**Trend-slope ETA to +5%:** {('~' + str(int(round(bars_needed)))) if bars_needed else 'n/a'} bars")
+            with col_eta2:
+                if med:
+                    st.markdown(f"**Historical ETA for +5%:** median {int(med)} bars (IQR {int(p25)}–{int(p75)})")
                 else:
-                    st.info("Need more history for ML preview (200+ rows and at least 50 label points).")
-            else:
-                st.info("scikit-learn not installed — skipping ML preview (optional).")
-        except Exception as e:
-            st.warning(f"ML section error: {e}")
+                    st.markdown("**Historical ETA for +5%:** n/a")
 
-        # Seasonality & News (note: seasonality is daily-based, still informative)
-        st.subheader("Seasonality & News Context (experimental)")
-        try:
-            # Use daily for seasonality stats regardless of tf
-            daily_for_season = get_data_for_timeframe(ticker, years_hist, "1D")
-            if not daily_for_season.empty:
-                dow_tbl, mon_tbl = seasonality_tables(daily_for_season)
-                csa, csb = st.columns(2)
-                with csa:
-                    st.markdown("**Avg NEXT-day return by weekday**")
-                    st.bar_chart(dow_tbl["avg_next_ret"]*100, use_container_width=True)
-                    st.caption("Percent. Positive = on average, tomorrow leans up after that weekday.")
-                with csb:
-                    st.markdown("**Avg NEXT-day return by month**")
-                    st.bar_chart(mon_tbl["avg_next_ret"]*100, use_container_width=True)
-                    this_mon = date.today().strftime("%b")
-                    if this_mon in mon_tbl.index:
-                        st.caption(f"Current month ({this_mon}) avg next-day: {mon_tbl.loc[this_mon,'avg_next_ret']*100:.2f}%")
-            news = fetch_rss_headlines(ticker, limit=10)
-            if news and HAVE_VADER:
-                df_news, overall = score_headlines_vader(news)
-                colh1, colh2 = st.columns([2,1])
-                with colh1:
-                    st.markdown("**Latest headlines**")
-                    for _, r in df_news.iterrows():
-                        tag = "🟢" if r["label"]=="Bullish" else ("🔴" if r["label"]=="Bearish" else "⚪")
-                        st.markdown(f"{tag} [{r['title']}]({r['link']})  \n"
-                                    f"<span style='opacity:0.7;font-size:0.85em'>{r['published']}</span>",
-                                    unsafe_allow_html=True)
-                with colh2:
-                    st.metric("Headline sentiment (avg)", f"{overall:+.2f}")
-                    st.write(df_news["label"].value_counts())
-            elif not HAVE_FEEDPARSER:
-                st.info("feedparser not installed — skipping headlines (optional).")
-            else:
-                st.info("No headlines fetched (RSS may be blocked/limited).")
-        except Exception as e:
-            st.info(f"Seasonality/news module skipped: {e}")
+# End Part 3
 
-        # Trade plan (based on selected timeframe bars)
-        st.subheader("Trade Plan (educational)")
-        latest  = df_all.iloc[-1]
-        trend_up = latest["EMA20"] > latest["EMA50"]
-        atr_val = float(latest["ATR14"]); close = float(latest["Close"])
-        ema20   = float(latest["EMA20"]); ema50 = float(latest["EMA50"])
-        hh20    = float(latest.get("HH20", np.nan)); ll20 = float(latest.get("LL20", np.nan))
-
-        # Plan inputs
-        cpa, cpb, cpc = st.columns(3)
-        with cpa:
-            account_size  = st.number_input("Account size ($)", min_value=0.0, value=10000.0, step=100.0, key="acct_size")
-        with cpb:
-            risk_pct      = st.slider("Risk per trade (%)", 0.1, 5.0, 1.0, step=0.1, key="risk_pct")
-        with cpc:
-            entry_style   = st.selectbox("Entry style", ["Pullback to EMA20","Breakout 20-day"], key="entry_style")
-
-        cpd, cpe, cpf = st.columns(3)
-        with cpd:
-            stop_atr_mult = st.slider("Stop distance (x ATR)", 0.5, 5.0, 1.5, step=0.1, key="stop_mult")
-        with cpe:
-            target_rr     = st.slider("Target multiple (R:R)", 0.5, 5.0, 2.0, step=0.5, key="target_rr")
-        with cpf:
-            lookback_eta  = st.slider("ETA slope lookback (bars)", 10, 60, 20, step=5, key="eta_lookback")
-
-        plan = plan_trade(latest, trend_up, atr_val, hh20, ll20, ema20, close,
-                          account_size, risk_pct, stop_atr_mult, target_rr, entry_style)
-
-        colA,colB,colC = st.columns(3)
-        colA.metric("Suggested Entry", f"{plan['entry']:,.2f}")
-        colB.metric("Stop", f"{plan['stop']:,.2f}")
-        colC.metric("Target", f"{plan['target']:,.2f}")
-
-        colD,colE,colF = st.columns(3)
-        colD.metric("Shares", f"{plan['shares']:,}")
-        colE.metric("Risk ($)", f"{plan['risk_dollars']:,.2f}")
-        colF.metric("Est. Reward ($)", f"{plan['reward_dollars']:,.2f}")
-
-        rr_val = plan.get("rr", float("nan"))
-        rr_str = f"{rr_val:.2f}" if (isinstance(rr_val, (int, float)) and np.isfinite(rr_val)) else "n/a"
-        st.caption(f"Method: {entry_style} | Stop {stop_atr_mult}x ATR | Target {target_rr}R. Approx R:R = {rr_str}")
-
-        # Time-to-Target (ETA) — computed in bars for the selected timeframe
-        try:
-            if plan["target"] > close:
-                eta1 = eta_trend_slope_days(df_all, current_price=close, target_price=plan["target"], lookback=lookback_eta)
-                pct_move = (plan["target"] / close) - 1.0 if close > 0 else np.nan
-                med, q1, q3 = eta_historical_window(df_all, pct_move=pct_move, lookback_bars=250, max_horizon=60)
-
-                st.subheader("Time-to-Target (rough)")
-                ceta1, ceta2 = st.columns(2)
-                with ceta1:
-                    if eta1 is not None:
-                        st.metric("Trend slope ETA (bars)", f"{eta1:.1f}", help="Based on recent log-price slope")
-                    else:
-                        st.metric("Trend slope ETA", "n/a")
-                with ceta2:
-                    if med is not None:
-                        st.metric("Historical median (bars)", f"{med:.0f}", help="IQR = middle 50%")
-                        if (q1 is not None) and (q3 is not None):
-                            st.caption(f"IQR {q1:.0f}–{q3:.0f} bars")
-                    else:
-                        st.metric("Historical median", "n/a")
-                st.caption("Educational estimate — volatility & news can change timing quickly.")
-        except Exception as e:
-            st.info(f"ETA module skipped: {e}")
-
-        # Order ticket
-        ticket_text, json_bytes, csv_bytes, txt_bytes = make_order_ticket(
-            ticker=ticker, side_long=trend_up, entry_style=entry_style,
-            entry=plan['entry'], stop=plan['stop'], target=plan['target'], shares=plan['shares'],
-            rr=plan['rr'], atr_val=atr_val, risk_dollars=plan['risk_dollars'], reward_dollars=plan['reward_dollars']
-        )
-
-        st.subheader("Order Ticket (copy/paste)")
-        st.code(ticket_text, language="text")
-        cdl1,cdl2,cdl3 = st.columns(3)
-        with cdl1: st.download_button("Download TXT",  data=txt_bytes,  file_name=f"{ticker.upper()}_ticket.txt",  mime="text/plain", key="dl_txt")
-        with cdl2: st.download_button("Download JSON", data=json_bytes, file_name=f"{ticker.upper()}_ticket.json", mime="application/json", key="dl_json")
-        with cdl3: st.download_button("Download CSV",  data=csv_bytes,  file_name=f"{ticker.upper()}_ticket.csv",  mime="text/csv", key="dl_csv")
-
-        st.subheader("Plan explainer")
-        st.markdown(explain_plan(
-            ticker, trend_up, entry_style, plan["entry"], plan["stop"], plan["target"],
-            float(latest["RSI14"]), atr_val, ema20, ema50, hh20, ll20
-        ))
