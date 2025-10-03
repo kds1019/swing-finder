@@ -249,14 +249,20 @@ else:
     if st.button("Run Analysis"):
         st.session_state.ran = True
         st.session_state.analysis_ticker = ticker_choice
+        
 # =========================
-# Analysis Modules
+# Part 3 — Analysis modules
 # =========================
-import requests, feedparser
+
+import requests
+import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from sklearn.linear_model import LinearRegression, RandomForestClassifier
+
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+
 
 # ---------- Plot ----------
 def plot_price(df):
