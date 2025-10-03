@@ -7,8 +7,9 @@ requests==2.32.3
 feedparser==6.0.11
 vaderSentiment==3.3.2
 
-# ML dependencies (needed for LinearRegression + ETA forecasts)
+# ML deps for forecast + ETA
 scikit-learn==1.4.2
 scipy==1.11.4
 joblib==1.3.2
 threadpoolctl==3.2.0
+
