@@ -441,44 +441,7 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
         out = pd.DataFrame(near_rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
     return pd.DataFrame(), stats
-# ---------------- Local AI helpers (Ollama) ----------------
-def ollama_available():
-    try: return requests.get("http://127.0.0.1:11434/api/tags", timeout=2).status_code == 200
-    except Exception: return False
 
-def list_ollama_models():
-    try:
-        r = requests.get("http://127.0.0.1:11434/api/tags", timeout=2)
-        r.raise_for_status()
-        return [m.get("name") for m in r.json().get("models", []) if m.get("name")]
-    except Exception:
-        return []
-
-def ask_local_llm(model_name: str, system_text: str, user_text: str, max_retries: int = 3) -> str:
-    url = "http://127.0.0.1:11434/api/chat"
-    payload = {"model":model_name, "messages":[{"role":"system","content":system_text},{"role":"user","content":user_text}], "stream":False}
-    fallbacks = ["llama3.2:1b","tinyllama:1.1b","qwen2.5:0.5b"]; tried=[model_name]; last=None
-    for i in range(max_retries):
-        try:
-            r = requests.post(url, json=payload, timeout=120)
-            if r.status_code == 200:
-                return r.json().get("message", {}).get("content", "").strip()
-            txt = r.text or ""
-            if r.status_code == 500 and "requires more system memory" in txt:
-                for fb in fallbacks:
-                    if fb in tried: continue
-                    tried.append(fb); payload["model"] = fb
-                    rr = requests.post(url, json=payload, timeout=120)
-                    if rr.status_code == 200:
-                        return f"(Used fallback {fb})\n\n" + rr.json().get("message", {}).get("content", "").strip()
-                return "(Local AI chat error: model too large; use a smaller model.)"
-            if r.status_code in (404, 400) and ("not found" in txt.lower() or "pull" in txt.lower()):
-                return "(Model not found. In PowerShell run:  ollama pull llama3.2:1b  then select it.)"
-            last = f"HTTP {r.status_code}: {txt[:200]}"
-        except Exception as e:
-            last = str(e)
-        time.sleep(2**i)
-    return f"(Local AI chat error after retries: {last})"
 
 # ---------------- Seasonality & News helpers ----------------
 def _prep_series_for_ts(df: pd.DataFrame) -> pd.Series:
@@ -611,20 +574,7 @@ with st.sidebar:
     debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
     run_market_scan = st.button("Scan Market", key="btn_scan_market")
 
-    # Local AI toggle
-    default_ai = os.environ.get("ENABLE_LOCAL_AI","false").lower() == "true"
-    AI_ENABLED = st.checkbox("Enable Local AI (Ollama)", value=default_ai,
-                             help="Runs only on your machine with Ollama. Not for Streamlit Cloud.",
-                             key="ai_enable_toggle")
-    if AI_ENABLED:
-        st.subheader("Local AI (Ollama)")
-        defaults  = ["llama3.2:1b","tinyllama:1.1b","qwen2.5:0.5b","llama3.2:3b","phi3:3.8b-mini"]
-        installed = list_ollama_models()
-        choices   = [m for m in defaults if (not installed) or m in installed]
-        model_name = st.selectbox("Model", choices, index=0, key="ai_model_select")
-        if installed: st.caption("Installed: " + ", ".join(installed[:8]) + ("..." if len(installed)>8 else ""))
-        if ollama_available(): st.success("Ollama detected.")
-        else: st.info("Ollama not detected. Install from ollama.com, then: ollama pull llama3.2:1b")
+   
 
 # ---------------- Top Buttons ----------------
 if st.button("Analyze", key="btn_analyze"):
@@ -829,15 +779,7 @@ if st.session_state.ran:
     st.markdown(explain_plan(ticker, trend_up, entry_style, plan["entry"], plan["stop"], plan["target"],
                              float(latest["RSI14"]), atr_val, ema20, ema50, hh20, ll20))
 
-    # Local AI chat
-    if "AI_ENABLED" in locals() and AI_ENABLED:
-        st.subheader("Ask LOCAL AI about this plan (Ollama)")
-        with st.form("ai_form", clear_on_submit=False):
-            q = st.text_area("Ask a question (education only):", key="ask_llm_text", height=100)
-            ask_now = st.form_submit_button("Ask Local AI")
-        if ask_now and q.strip():
-            now = time.time(); MIN_GAP = 4
-            if now - st.session_state.last_ai_ts < MIN_GAP:
+    MIN_GAP:
                 wait = int(MIN_GAP - (now - st.session_state.last_ai_ts))
                 st.info(f"Cooling down... try again in ~{wait}s.")
             else:
