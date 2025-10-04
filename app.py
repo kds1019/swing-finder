@@ -604,8 +604,49 @@ with col_top_a:
         st.session_state.ran = True
 with col_top_b:
     st.button("New analysis (reset)", on_click=lambda: st.session_state.update(ran=False))
+# ---------------- Watchlist Screener output (Webull-style) ----------------
+if run_screen:
+    tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
+    if not tickers:
+        st.warning("No tickers provided.")
+    else:
+        passes, near_rows = run_watchlist_screener(tickers, years=screen_years)
 
-# ---------------- Market Scanner output (Passes & Near Misses) ----------------
+        tab1, tab2, tab3 = st.tabs(["✅ Passes", "⚠️ Near Misses", "📊 Top Ranked"])
+
+        if passes:
+            with tab1:
+                df_pass = pd.DataFrame(passes).sort_values("Score", ascending=False).reset_index(drop=True)
+                df_pass.insert(0,"Rank",np.arange(1,len(df_pass)+1))
+                st.dataframe(df_pass, use_container_width=True)
+        else:
+            with tab1:
+                st.info("No passes found.")
+
+        if near_rows:
+            with tab2:
+                df_near = pd.DataFrame(near_rows).sort_values("Score", ascending=False).reset_index(drop=True)
+                df_near.insert(0,"Rank",np.arange(1,len(df_near)+1))
+                st.dataframe(df_near, use_container_width=True)
+        else:
+            with tab2:
+                st.info("No near misses found.")
+
+        if not passes and not near_rows:
+            combined = passes + near_rows
+            if combined:
+                df_all = pd.DataFrame(combined).sort_values("Score", ascending=False).head(20).reset_index(drop=True)
+                df_all.insert(0,"Rank",np.arange(1,len(df_all)+1))
+                with tab3:
+                    st.dataframe(df_all, use_container_width=True)
+            else:
+                with tab3:
+                    st.warning("No tickers met any criteria.")
+        else:
+            with tab3:
+                st.caption("Top Ranked shows only if no passes or near misses.")
+
+# ---------------- Market Scanner output (Webull-style) ----------------
 scan_clicked = st.sidebar.button("Scan Market")
 if scan_clicked:
     if custom_universe.strip():
@@ -621,29 +662,44 @@ if scan_clicked:
         universe_label = universe
 
     st.subheader(f"Market Scanner — {universe_label} ({strictness})")
-    st.caption(f"Filters: {universe_label} | ${price_min:.2f}–${price_max:.2f} | Min Avg $ Vol(20d): {liq:.1f}M | Mode: {setup_mode} | Scanned: {stats['start']}")
+    st.caption(
+        f"Filters: {universe_label} | ${price_min:.2f}–${price_max:.2f} "
+        f"| Min Avg $ Vol(20d): {liq:.1f}M | Mode: {setup_mode} | Scanned: {stats['start']}"
+    )
 
     if debug_scan:
-        st.write({
-            "universe": stats["universe"],
-            "start_symbols": stats["start"],
-            "after_price": stats["after_price"],
-            "after_liquidity": stats["after_liquidity"],
-            "ok_setups": stats["ok"],
-            "near_miss": stats["near"],
-            "errors": stats["errors"],
-            "sample_symbols": stats["sample"],
-        })
+        st.write(stats)
+
+    tab1, tab2, tab3 = st.tabs(["✅ Passes", "⚠️ Near Misses", "📊 Top Ranked"])
+
+    if df_pass is not None and not df_pass.empty:
+        with tab1:
+            st.dataframe(df_pass, use_container_width=True)
+    else:
+        with tab1:
+            st.info("No passes found.")
+
+    if df_near is not None and not df_near.empty:
+        with tab2:
+            st.dataframe(df_near, use_container_width=True)
+    else:
+        with tab2:
+            st.info("No near misses found.")
 
     if (df_pass is None or df_pass.empty) and (df_near is None or df_near.empty):
-        st.info("No candidates met your filters. Try Strictness = Loose, lower Min Avg $ Vol, widen price, or use a Custom universe.")
+        # fallback top ranked
+        all_rows = pd.concat([df_pass, df_near], axis=0, ignore_index=True) if df_pass is not None and df_near is not None else pd.DataFrame()
+        if not all_rows.empty:
+            topN = all_rows.sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).head(20)
+            topN.insert(0,"Rank",np.arange(1,len(topN)+1))
+            with tab3:
+                st.dataframe(topN, use_container_width=True)
+        else:
+            with tab3:
+                st.warning("No tickers met any criteria.")
     else:
-        if df_pass is not None and not df_pass.empty:
-            st.markdown("### ✅ Passes")
-            st.dataframe(df_pass, use_container_width=True)
-        if df_near is not None and not df_near.empty:
-            st.markdown("### ⚠️ Near Misses")
-            st.dataframe(df_near, use_container_width=True)
+        with tab3:
+            st.caption("Top Ranked shows only if no passes or near misses.")
 
 # ---------------- Single Ticker analysis ----------------
 if st.session_state.ran:
