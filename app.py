@@ -1,7 +1,7 @@
 # app.py
-# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news
-# Run: streamlit run app.py
-# NOTE: Educational tool only. Not financial advice.
+# SwingFinder — Screener + Scanner + Plan + ML + Seasonality + News
+# Run with: streamlit run app.py
+# Educational tool only. Not financial advice.
 
 import warnings, os, io, json, math, time
 warnings.filterwarnings("ignore")
@@ -21,17 +21,23 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# Sentiment/news deps
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------------- Streamlit setup ----------------
-st.set_page_config(page_title="Swing Trader (Learn)", layout="wide")
-st.title("Simple Swing Trading Helper")
+st.set_page_config(page_title="SwingFinder", layout="wide")
+st.title("SwingFinder")
 st.caption("For learning only. Not financial advice.")
 
-# Session state
-if "ran" not in st.session_state: st.session_state.ran = False
+# ---------------- Session State ----------------
+if "ran" not in st.session_state: 
+    st.session_state.ran = False
+if "watchlists" not in st.session_state:
+    st.session_state.watchlists = {
+        "Default": ["AAPL","MSFT","NVDA","TSLA","META"]
+    }
+if "active_watchlist" not in st.session_state:
+    st.session_state.active_watchlist = "Default"
 
 # ---------------- Helpers ----------------
 def get_secret(name: str, default=None):
@@ -156,7 +162,7 @@ def plot_price(df: pd.DataFrame):
                       margin=dict(l=10,r=10,t=30,b=10))
     return fig
 
-# ---------------- Plan & Ticket ----------------
+# ---------------- Trade Plan & Ticket ----------------
 def plan_trade(latest_row: pd.Series, trend_up: bool, atr_val: float, hh20: float, ll20: float,
                ema20: float, close: float, account_size: float, risk_pct: float,
                stop_atr_mult: float, target_rr: float, entry_style: str):
@@ -212,62 +218,89 @@ def make_order_ticket(ticker: str, side_long: bool, entry_style: str, entry: flo
     txt_bytes  = io.BytesIO(text.encode("utf-8"))
     return text, json_bytes, csv_bytes, txt_bytes
 
-def explain_plan(ticker, trend_up, entry_style, entry, stop, target, rsi_val, atr, ema20, ema50, hh20, ll20):
-    bias = "long" if trend_up else "short"
-    lines = [
-        f"{ticker.upper()} - Plan rationale",
-        f"- Bias: {bias} (EMA20 {'>' if trend_up else '<'} EMA50)",
-        f"- Entry style: {entry_style} at ~{entry:,.2f}",
-        f"- Stop uses ATR ({atr:,.2f}) -> stop ~{stop:,.2f}",
-        f"- Target via R multiple -> ~{target:,.2f}",
-        f"- Trend context: EMA20 {ema20:,.2f}, EMA50 {ema50:,.2f}"
+# ---------------- Watchlist Manager ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("📌 Watchlist Manager")
+
+wl_names = list(st.session_state.watchlists.keys())
+chosen = st.sidebar.selectbox("Select watchlist", wl_names, 
+                              index=wl_names.index(st.session_state.active_watchlist))
+
+if st.sidebar.button("Load Watchlist"):
+    st.session_state.active_watchlist = chosen
+
+# Show current watchlist for editing
+wl_input = st.sidebar.text_area(
+    "Edit watchlist (comma tickers)",
+    ", ".join(st.session_state.watchlists[chosen]),
+    height=80
+)
+
+# Save or update
+new_name = st.sidebar.text_input("Save as new watchlist name")
+if st.sidebar.button("Save Watchlist") and new_name.strip():
+    st.session_state.watchlists[new_name.strip()] = [
+        t.strip().upper() for t in wl_input.split(",") if t.strip()
     ]
-    if pd.notna(hh20) and pd.notna(ll20):
-        lines.append(f"- Recent 20-day range: {ll20:,.2f} -> {hh20:,.2f}")
-    if pd.notna(rsi_val):
-        if rsi_val < 40: lines.append("- RSI < 40 -> weak momentum; be conservative.")
-        elif rsi_val > 60: lines.append("- RSI > 60 -> firm momentum; breakouts may follow through.")
-        else: lines.append("- RSI ~ 40-60 -> neutral; expect chop.")
-    return "\n".join(lines)
+if st.sidebar.button("Update Current"):
+    st.session_state.watchlists[chosen] = [
+        t.strip().upper() for t in wl_input.split(",") if t.strip()
+    ]
 
-# ---------------- Watchlist helper ----------------
-def load_watchlist_from_url(url: str) -> list[str]:
-    try:
-        df = pd.read_csv(url, header=None)
-        return [str(t).strip().upper() for t in df.iloc[:, 0].tolist() if str(t).strip()]
-    except Exception:
-        return []
+# ---------------- Watchlist Screener ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔎 Watchlist Screener")
+screen_years = st.sidebar.slider("Screener lookback (years)", 1, 5, 1)
+run_screen   = st.sidebar.button("Run Screener")
 
-# ---------------- Universes with fallbacks ----------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_sp500_tickers() -> list[str]:
-    fallback = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","TSLA","AVGO","GOOG"]
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        syms = tables[0]["Symbol"].astype(str).tolist()
-        out = [s.replace(".","-").upper().strip() for s in syms if s]
-        return out or fallback
-    except Exception:
-        return fallback
+def run_watchlist_screener(tickers, years):
+    passes, near_rows = [], []
+    for t in tickers:
+        sdf = load_data(t, years=years)
+        if sdf.empty: 
+            continue
+        sdf = build_indicators(sdf); last = sdf.iloc[-1]
+        close = float(last["Close"])
+        trend_up = bool(last["EMA20"] > last["EMA50"])
+        buy  = bool(last["buy_signal"]); sell = bool(last["sell_signal"])
+        rsi_v = float(last["RSI14"])
+        bb_dn = float(last.get("BB_DN", np.nan)); bb_up = float(last.get("BB_UP", np.nan))
+        band = (close - bb_dn)/(bb_up - bb_dn) if np.isfinite(bb_dn) and np.isfinite(bb_up) and (bb_up-bb_dn)>0 else np.nan
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_nasdaq100_tickers() -> list[str]:
-    fallback = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","NFLX","ADBE"]
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
-        table = None
-        for t in tables:
-            cols = [str(c).lower() for c in t.columns]
-            if "ticker" in cols or "symbol" in cols:
-                table = t; break
-        if table is None: return fallback
-        col = [c for c in table.columns if str(c).lower() in ("ticker","symbol")][0]
-        syms = table[col].astype(str).tolist()
-        out = [s.replace(".","-").upper().strip() for s in syms if s]
-        return out or fallback
-    except Exception:
-        return fallback
+        score = 0; reason = []
+        if trend_up and 43 <= rsi_v <= 62 and (0.08 <= (band if np.isfinite(band) else 0.5) <= 0.60):
+            score += 2; reason.append("pullback-window")
+        if buy:
+            score += 2; reason.append("buy-signal")
+        if trend_up and rsi_v > 50:
+            score += 1
 
+        row = {"Ticker":t,"Close":round(close,2),"RSI14":round(rsi_v,1),
+               "BandPos":None if np.isnan(band) else round(band,2),
+               "TrendUp":trend_up,"Score":score,
+               "Reason":",".join(reason) if reason else "-"}
+
+        if score >= 2:
+            passes.append(row)
+        elif score >= 1:
+            near_rows.append(row)
+
+    return passes, near_rows
+
+if run_screen:
+    tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
+    if not tickers:
+        st.warning("No tickers provided.")
+    else:
+        passes, near_rows = run_watchlist_screener(tickers, years=screen_years)
+        if passes:
+            st.subheader("✅ Screener Passes")
+            st.dataframe(pd.DataFrame(passes).sort_values("Score", ascending=False).reset_index(drop=True), use_container_width=True)
+        if near_rows:
+            st.subheader("⚠️ Near Misses")
+            st.dataframe(pd.DataFrame(near_rows).sort_values("Score", ascending=False).reset_index(drop=True), use_container_width=True)
+        if not passes and not near_rows:
+            st.info("No watchlist candidates met your screener filters.")
 # ---------------- Scanner logic ----------------
 def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"):
     trend_up = bool(last["EMA20"] > last["EMA50"])
@@ -275,7 +308,7 @@ def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"
     close = float(last["Close"])
     bb_dn = float(last.get("BB_DN", np.nan))
     bb_up = float(last.get("BB_UP", np.nan))
-    hh20 = float(last.get("HH20", np.nan))
+    hh20  = float(last.get("HH20", np.nan))
     band_pos = np.nan
     if np.isfinite(bb_dn) and np.isfinite(bb_up) and (bb_up - bb_dn) > 0:
         band_pos = (close - bb_dn) / (bb_up - bb_dn)
@@ -296,11 +329,13 @@ def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"
     buy_trigger = bool(last.get("buy_signal", False))
     score = 0; ok = False; reason = []
 
+    # Pullback window (trend up, RSI and bandpos inside window)
     cond_pull = trend_up and (pull_rsi_lo <= rsi_v <= pull_rsi_hi) and \
                 (pull_band_lo <= (band_pos if np.isfinite(band_pos) else 0.5) <= pull_band_hi)
     if mode in ("Pullback","Both") and cond_pull:
         ok = True; score += 2; reason.append("pullback-window")
 
+    # Breakout: near 20d high or buy trigger
     near_high = np.isfinite(hh20) and (close >= brk_near*hh20) and trend_up and (rsi_v >= brk_rsi_min)
     if mode in ("Breakout","Both") and (buy_trigger or near_high):
         ok = True; score += 2; reason.append("buy-signal" if buy_trigger else "breakout-near-high")
@@ -309,15 +344,32 @@ def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"
         score += 1
 
     return ok, score, band_pos, (",".join(reason) if reason else "-")
-# ---------------- Scanner functions ----------------
+
 @st.cache_data(ttl=900, show_spinner=True)
 def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                   min_dollar_vol_millions: float, mode: str, strictness: str = "Balanced",
                   max_symbols: int = 100):
     if universe == "S&P 500":
-        tickers = get_sp500_tickers()
+        try:
+            tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+            syms = tables[0]["Symbol"].astype(str).tolist()
+            tickers = [s.replace(".","-").upper().strip() for s in syms if s]
+        except Exception:
+            tickers = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","GOOG","JPM"]
     elif universe == "NASDAQ-100":
-        tickers = get_nasdaq100_tickers()
+        try:
+            tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+            table = None
+            for t in tables:
+                cols = [str(c).lower() for c in t.columns]
+                if "ticker" in cols or "symbol" in cols:
+                    table = t; break
+            if table is None: raise RuntimeError("No table")
+            col = [c for c in table.columns if str(c).lower() in ("ticker","symbol")][0]
+            syms = table[col].astype(str).tolist()
+            tickers = [s.replace(".","-").upper().strip() for s in syms if s]
+        except Exception:
+            tickers = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","AVGO","NFLX","ADBE","AMD"]
     else:
         tickers = []
     tickers = tickers[:max_symbols]
@@ -325,7 +377,7 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
     stats = {"universe": universe, "start": len(tickers), "after_price": 0,
              "after_liquidity": 0, "ok": 0, "near": 0, "errors": 0, "sample": tickers[:10]}
 
-    rows = []; near_rows = []
+    passes, near_rows = [], []
 
     for t in tickers:
         try:
@@ -350,10 +402,12 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                     "TrendUp":bool(last["EMA20"]>last["EMA50"]),
                     "RSI14":round(float(last["RSI14"]),1),
                     "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
-                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score)}
-            if ok:
-                base["Reason"]=why; rows.append(base); stats["ok"] += 1
+                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),"Reason":why}
+
+            if ok and score >= 2:
+                passes.append(base); stats["ok"] += 1
             else:
+                # near-miss heuristics
                 near_score=0
                 if base["TrendUp"]: near_score += 1
                 if base["RSI14"] >= 48: near_score += 1
@@ -366,27 +420,22 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
             stats["errors"] += 1
             continue
 
-    if rows:
-        out = pd.DataFrame(rows).sort_values(
-            ["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]
-        ).reset_index(drop=True)
-        out.insert(0,"Rank",np.arange(1,len(out)+1))
-        return out, stats
+    def _sort(df_):
+        return df_.sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).reset_index(drop=True)
 
-    if near_rows:
-        out = pd.DataFrame(near_rows).sort_values(
-            ["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]
-        ).head(20).reset_index(drop=True)
-        out.insert(0,"Rank",np.arange(1,len(out)+1))
-        return out, stats
-
-    return pd.DataFrame(), stats
+    df_pass = _sort(pd.DataFrame(passes)) if passes else pd.DataFrame()
+    df_near = _sort(pd.DataFrame(near_rows)) if near_rows else pd.DataFrame()
+    if not df_pass.empty:
+        df_pass.insert(0,"Rank",np.arange(1,len(df_pass)+1))
+    if not df_near.empty:
+        df_near.insert(0,"Rank",np.arange(1,len(df_near)+1))
+    return df_pass, df_near, stats
 
 @st.cache_data(ttl=600, show_spinner=True)
 def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: float,
                     min_dollar_vol_millions: float, mode: str, strictness: str, max_symbols: int):
-    rows = []; near_rows = []
     ticks = [t.strip().upper() for t in ticks if t.strip()][:max_symbols]
+    passes, near_rows = [], []
     stats = {"universe":"Custom","start":len(ticks),"after_price":0,"after_liquidity":0,
              "ok":0,"near":0,"errors":0,"sample":ticks[:10]}
     for t in ticks:
@@ -409,9 +458,9 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
                     "TrendUp":bool(last["EMA20"]>last["EMA50"]),
                     "RSI14":round(float(last["RSI14"]),1),
                     "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
-                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score)}
-            if ok:
-                base["Reason"]=why; rows.append(base); stats["ok"] += 1
+                    "BUY?":bool(last.get("buy_signal",False)),"Score":int(score),"Reason":why}
+            if ok and score >= 2:
+                passes.append(base); stats["ok"] += 1
             else:
                 near_score=0
                 if base["TrendUp"]: near_score += 1
@@ -423,13 +472,14 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
                     near_rows.append(nm); stats["near"] += 1
         except Exception:
             stats["errors"] += 1
-    if rows:
-        out = pd.DataFrame(rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).reset_index(drop=True)
-        out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
-    if near_rows:
-        out = pd.DataFrame(near_rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).head(20).reset_index(drop=True)
-        out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
-    return pd.DataFrame(), stats
+    df_pass = pd.DataFrame(passes); df_near = pd.DataFrame(near_rows)
+    if not df_pass.empty:
+        df_pass = df_pass.sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).reset_index(drop=True)
+        df_pass.insert(0,"Rank",np.arange(1,len(df_pass)+1))
+    if not df_near.empty:
+        df_near = df_near.sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).reset_index(drop=True)
+        df_near.insert(0,"Rank",np.arange(1,len(df_near)+1))
+    return df_pass, df_near, stats
 
 # ---------------- Seasonality & News helpers ----------------
 def _prep_series_for_ts(df: pd.DataFrame) -> pd.Series:
@@ -487,7 +537,7 @@ def _get_vader():
 
 def fetch_rss_headlines(ticker: str, limit: int = 12):
     feeds = [
-        f"https://feeds.finance.yahoo.com/rss/2.0headline?s={ticker}&region=US&lang=en-US".replace("2.0headline","2.0/headline"),
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
         f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en",
     ]
     out = []
@@ -520,96 +570,58 @@ def score_headlines_vader(headlines: list[dict]):
         return df, float(df["compound"].mean())
     return pd.DataFrame(columns=["title","link","published","compound","label"]), 0.0
 
-# ---------------- Sidebar ----------------
-with st.sidebar:
-    ticker    = st.text_input("Stock ticker (e.g., AAPL, MSFT, TSLA)", "AAPL", key="main_ticker_input")
-    years     = st.slider("Years of history", 1, 10, 3, key="main_years_slider")
-    lookback  = st.slider("Forecast lookback (days)", 5, 60, 20, key="main_lookback_slider")
-    st.caption("Tip: some tickers need suffixes like VOD.L or SHOP.TO.")
+# ---------------- Sidebar (Analysis & Scanner controls) ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Single-Ticker Analysis")
+ticker    = st.sidebar.text_input("Stock ticker (e.g., AAPL, MSFT, TSLA)", "AAPL")
+years     = st.sidebar.slider("Years of history", 1, 10, 3)
+lookback  = st.sidebar.slider("Forecast lookback (days)", 5, 60, 20)
 
-    st.markdown("---")
-    st.subheader("Risk & Plan")
-    account_size  = st.number_input("Account size ($)", min_value=0.0, value=10000.0, step=100.0, key="main_account_size")
-    risk_pct      = st.slider("Risk per trade (%)", 0.1, 5.0, 1.0, step=0.1, key="main_risk_pct")
-    stop_atr_mult = st.slider("Stop distance (x ATR)", 0.5, 5.0, 1.5, step=0.1, key="main_stop_atr_mult")
-    target_rr     = st.slider("Target multiple (R:R)", 0.5, 5.0, 2.0, step=0.5, key="main_target_rr")
-    entry_style   = st.selectbox("Entry style", ["Pullback to EMA20","Breakout 20-day"], key="main_entry_style")
+st.sidebar.subheader("🛡️ Risk & Plan")
+account_size  = st.sidebar.number_input("Account size ($)", min_value=0.0, value=10000.0, step=100.0)
+risk_pct      = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 1.0, step=0.1)
+stop_atr_mult = st.sidebar.slider("Stop distance (x ATR)", 0.5, 5.0, 1.5, step=0.1)
+target_rr     = st.sidebar.slider("Target multiple (R:R)", 0.5, 5.0, 2.0, step=0.5)
+entry_style   = st.sidebar.selectbox("Entry style", ["Pullback to EMA20","Breakout 20-day"])
 
-    # Watchlist via URL (optional)
-    WATCHLIST_URL = get_secret("WATCHLIST_URL", None)
-    default_wl = ["AAPL","MSFT","NVDA","TSLA","META"]
-    if WATCHLIST_URL:
-        wl_from_url = load_watchlist_from_url(WATCHLIST_URL)
-        if wl_from_url: default_wl = wl_from_url
-
-    st.markdown("---")
-    st.subheader("Watchlist Screener")
-    wl_input     = st.text_area("Comma-separated tickers", ", ".join(default_wl), height=80, key="main_wl_input")
-    screen_years = st.slider("Screener lookback (years)", 1, 5, 1, key="main_screen_years")
-    run_screen   = st.button("Run Screener", key="btn_run_screen")
-
-    st.markdown("---")
-    st.subheader("Market Scanner (no watchlist)")
-    universe     = st.selectbox("Universe", ["S&P 500","NASDAQ-100"], index=0, key="scan_universe")
-    scan_years   = st.slider("History (years)", 1, 5, 2, key="scan_years")
-    price_min    = st.number_input("Min price ($)", 0.0, value=5.0, step=0.5, key="scan_price_min")
-    price_max    = st.number_input("Max price ($)", 0.0, value=20.0, step=0.5, key="scan_price_max")
-    liq          = st.number_input("Min Avg $ Volume (20d, M)", 0.0, value=2.0, step=0.5, key="scan_min_dollar_vol")
-    setup_mode   = st.radio("Setup type", ["Both","Pullback","Breakout"], horizontal=True, key="scan_mode")
-    strictness   = st.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0, key="scan_strictness")
-    max_symbols  = st.slider("Max symbols to scan", 20, 200, 100, step=10, key="scan_max_symbols")
-    custom_universe = st.text_area("Custom universe (optional, comma tickers)", "", height=60, key="scan_custom_universe")
-    debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
-    run_market_scan = st.button("Scan Market", key="btn_scan_market")
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌐 Market Scanner")
+universe     = st.sidebar.selectbox("Universe", ["S&P 500","NASDAQ-100"], index=0)
+scan_years   = st.sidebar.slider("History (years)", 1, 5, 2)
+price_min    = st.sidebar.number_input("Min price ($)", 0.0, value=5.0, step=0.5)
+price_max    = st.sidebar.number_input("Max price ($)", 0.0, value=20.0, step=0.5)
+liq          = st.sidebar.number_input("Min Avg $ Volume (20d, M)", 0.0, value=2.0, step=0.5)
+setup_mode   = st.sidebar.radio("Setup type", ["Both","Pullback","Breakout"], horizontal=True)
+strictness   = st.sidebar.selectbox("Scanner strictness", ["Balanced","Strict","Loose"], index=0)
+max_symbols  = st.sidebar.slider("Max symbols to scan", 20, 200, 100, step=10)
+custom_universe = st.sidebar.text_area("Custom universe (optional, comma tickers)", "", height=60)
+debug_scan   = st.sidebar.checkbox("Show scanner debug", value=False)
 
 # ---------------- Top Buttons ----------------
-if st.button("Analyze", key="btn_analyze"):
-    st.session_state.ran = True
-st.button("New analysis (reset)", key="btn_reset",
-          on_click=lambda: st.session_state.update(ran=False))
+col_top_a, col_top_b, col_top_c = st.columns([1,1,3])
+with col_top_a:
+    if st.button("Analyze"):
+        st.session_state.ran = True
+with col_top_b:
+    st.button("New analysis (reset)", on_click=lambda: st.session_state.update(ran=False))
 
-# ---------------- Watchlist Screener output ----------------
-if run_screen:
-    tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
-    if not tickers:
-        st.warning("No tickers provided.")
-    else:
-        rows = []
-        for t in tickers:
-            sdf = load_data(t, years=screen_years)
-            if sdf.empty: 
-                continue
-            sdf = build_indicators(sdf); last = sdf.iloc[-1]
-            close = float(last["Close"])
-            trend_up = bool(last["EMA20"] > last["EMA50"])
-            buy  = bool(last["buy_signal"]); sell = bool(last["sell_signal"])
-            rsi_v = float(last["RSI14"])
-            bb_dn = float(last.get("BB_DN", np.nan)); bb_up = float(last.get("BB_UP", np.nan)); band = np.nan
-            if np.isfinite(bb_dn) and np.isfinite(bb_up) and (bb_up-bb_dn)>0:
-                band = (close - bb_dn)/(bb_up - bb_dn)
-            score = (1 if buy else 0) - (1 if sell else 0) + (1 if (trend_up and rsi_v>50) else 0)
-            rows.append({"Ticker":t,"Close":round(close,2),"TrendUp":trend_up,"RSI14":round(rsi_v,1),
-                         "BandPos(0=low,1=high)": None if np.isnan(band) else round(band,2),
-                         "BUY?":buy,"SELL?":sell,"Score":score})
-        if rows:
-            df_screen = pd.DataFrame(rows).sort_values(["Score","RSI14"], ascending=[False,False]).reset_index(drop=True)
-            st.subheader("Watchlist Screener Results")
-            st.dataframe(df_screen, use_container_width=True)
-        else:
-            st.info("No watchlist candidates met your screener filters.")
-
-# ---------------- Market Scanner output ----------------
-if run_market_scan:
+# ---------------- Market Scanner output (Passes & Near Misses) ----------------
+scan_clicked = st.sidebar.button("Scan Market")
+if scan_clicked:
     if custom_universe.strip():
         tickers_override = [t.strip().upper() for t in custom_universe.split(",") if t.strip()]
-        res, stats = scan_fixed_list(tickers_override, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols)
+        df_pass, df_near, stats = scan_fixed_list(
+            tickers_override, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols
+        )
         universe_label = f"Custom ({len(tickers_override)})"
     else:
-        res, stats = scan_universe(universe, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols)
+        df_pass, df_near, stats = scan_universe(
+            universe, scan_years, price_min, price_max, liq, setup_mode, strictness, max_symbols
+        )
         universe_label = universe
 
-    st.subheader(f"Market Scanner Results — {universe_label} ({strictness})")
-    st.caption(f"Filters: {universe_label} | ${price_min:.2f} to ${price_max:.2f} | Min Avg $ Vol(20d): {liq:.1f}M | Mode: {setup_mode} | Strictness: {strictness} | Scanned: {stats['start']}")
+    st.subheader(f"Market Scanner — {universe_label} ({strictness})")
+    st.caption(f"Filters: {universe_label} | ${price_min:.2f}–${price_max:.2f} | Min Avg $ Vol(20d): {liq:.1f}M | Mode: {setup_mode} | Scanned: {stats['start']}")
 
     if debug_scan:
         st.write({
@@ -623,10 +635,15 @@ if run_market_scan:
             "sample_symbols": stats["sample"],
         })
 
-    if res is None or res.empty:
+    if (df_pass is None or df_pass.empty) and (df_near is None or df_near.empty):
         st.info("No candidates met your filters. Try Strictness = Loose, lower Min Avg $ Vol, widen price, or use a Custom universe.")
     else:
-        st.dataframe(res, use_container_width=True)
+        if df_pass is not None and not df_pass.empty:
+            st.markdown("### ✅ Passes")
+            st.dataframe(df_pass, use_container_width=True)
+        if df_near is not None and not df_near.empty:
+            st.markdown("### ⚠️ Near Misses")
+            st.dataframe(df_near, use_container_width=True)
 
 # ---------------- Single Ticker analysis ----------------
 if st.session_state.ran:
@@ -684,7 +701,7 @@ if st.session_state.ran:
             m2.metric("Backtest Accuracy*", f"{acc*100:.1f}%")
             m3.metric("Top feature", imps.index[0])
             with st.expander("Feature importances"):
-                st.write(imps.to_frame("importance"))
+                st.dataframe(imps.to_frame("importance"))
             st.caption("*Toy model, simple split. Educational only.")
         else:
             st.info("Need more history for ML preview (200+ rows).")
