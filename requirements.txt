@@ -3,13 +3,7 @@ yfinance==0.2.41
 pandas==2.2.3
 numpy==1.26.4
 plotly==5.22.0
+scikit-learn==1.5.2
 requests==2.32.3
-feedparser==6.0.11
 vaderSentiment==3.3.2
-
-# ML deps for forecast + ETA
-scikit-learn==1.4.2
-scipy==1.11.4
-joblib==1.3.2
-threadpoolctl==3.2.0
-
+feedparser==6.0.11
