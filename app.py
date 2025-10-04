@@ -1,5 +1,5 @@
 # app.py
-# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news + optional local AI (Ollama)
+# Simple Swing Trading Helper — scanner + screener + plan + ML + seasonality/news
 # Run: streamlit run app.py
 # NOTE: Educational tool only. Not financial advice.
 
@@ -21,7 +21,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# NEW: sentiment/news deps
+# Sentiment/news deps
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
@@ -32,10 +32,8 @@ st.caption("For learning only. Not financial advice.")
 
 # Session state
 if "ran" not in st.session_state: st.session_state.ran = False
-if "last_ai" not in st.session_state: st.session_state.last_ai = ""
-if "last_ai_ts" not in st.session_state: st.session_state.last_ai_ts = 0.0
 
-# ---------------- Small helpers ----------------
+# ---------------- Helpers ----------------
 def get_secret(name: str, default=None):
     v = os.environ.get(name)
     if v is not None:
@@ -243,14 +241,7 @@ def load_watchlist_from_url(url: str) -> list[str]:
 # ---------------- Universes with fallbacks ----------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_sp500_tickers() -> list[str]:
-    fallback = [
-        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","TSLA","AVGO","GOOG",
-        "LLY","JPM","V","XOM","JNJ","WMT","UNH","PG","MA","COST","HD","BAC",
-        "MRK","ABBV","KO","PEP","CVX","NFLX","ADBE","CSCO","ACN","LIN","CRM",
-        "AMD","TMO","MCD","INTC","WFC","ABT","BMY","TXN","COP","PM","IBM",
-        "AMAT","NEE","GE","NOW","CAT","ORCL","PFE","QCOM","LOW","BKNG","MS",
-        "HON","GS","RTX","SPGI","AXP","BLK","DE","ISRG","PLD","SCHW","UPS"
-    ]
+    fallback = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","BRK-B","TSLA","AVGO","GOOG"]
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         syms = tables[0]["Symbol"].astype(str).tolist()
@@ -261,13 +252,7 @@ def get_sp500_tickers() -> list[str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_nasdaq100_tickers() -> list[str]:
-    fallback = [
-        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","NFLX","ADBE",
-        "AMD","TSLA","COST","PEP","INTC","CSCO","AMAT","QCOM","PDD","BKNG","LIN",
-        "VRTX","TMUS","LRCX","MU","PANW","REGN","ISRG","ADI","HON","GEHC","ZM",
-        "ADP","MDLZ","MAR","KDP","ABNB","FTNT","CRWD","MNST","GILD","KLAC","SNPS",
-        "NXPI","CSX","MRVL","CHTR","AEP","ORLY","MELI","ODFL","EA","CDNS"
-    ]
+    fallback = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","NFLX","ADBE"]
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
         table = None
@@ -285,7 +270,6 @@ def get_nasdaq100_tickers() -> list[str]:
 
 # ---------------- Scanner logic ----------------
 def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"):
-    """Return (ok, score, band_pos, reason) given setup mode and strictness."""
     trend_up = bool(last["EMA20"] > last["EMA50"])
     rsi_v = float(last["RSI14"])
     close = float(last["Close"])
@@ -325,7 +309,7 @@ def good_position_flags(last: pd.Series, mode: str, strictness: str = "Balanced"
         score += 1
 
     return ok, score, band_pos, (",".join(reason) if reason else "-")
-
+# ---------------- Scanner functions ----------------
 @st.cache_data(ttl=900, show_spinner=True)
 def scan_universe(universe: str, years: int, price_min: float, price_max: float,
                   min_dollar_vol_millions: float, mode: str, strictness: str = "Balanced",
@@ -346,17 +330,19 @@ def scan_universe(universe: str, years: int, price_min: float, price_max: float,
     for t in tickers:
         try:
             df = load_data(t, years)
-            if sdf := df is None: pass  # no-op to keep linter quiet if needed
-            if df.empty: continue
+            if df.empty: 
+                continue
             df = build_indicators(df); last = df.iloc[-1]
             close = float(last["Close"])
 
-            if not (price_min <= close <= price_max): continue
+            if not (price_min <= close <= price_max): 
+                continue
             stats["after_price"] += 1
 
             adv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[-1]
             adv_m = float(adv)/1_000_000.0 if pd.notna(adv) else 0.0
-            if adv_m < min_dollar_vol_millions: continue
+            if adv_m < min_dollar_vol_millions: 
+                continue
             stats["after_liquidity"] += 1
 
             ok, score, band, why = good_position_flags(last, mode, strictness)
@@ -406,14 +392,17 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
     for t in ticks:
         try:
             df = load_data(t, years)
-            if df.empty: continue
+            if df.empty: 
+                continue
             df = build_indicators(df); last = df.iloc[-1]
             close = float(last["Close"])
-            if not (price_min <= close <= price_max): continue
+            if not (price_min <= close <= price_max): 
+                continue
             stats["after_price"] += 1
             adv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[-1]
             adv_m = float(adv)/1_000_000.0 if pd.notna(adv) else 0.0
-            if adv_m < min_dollar_vol_millions: continue
+            if adv_m < min_dollar_vol_millions: 
+                continue
             stats["after_liquidity"] += 1
             ok, score, band, why = good_position_flags(last, mode, strictness)
             base = {"Ticker":t,"Close":round(close,2),"Avg$Vol(20d, M)":round(adv_m,2),
@@ -441,7 +430,6 @@ def scan_fixed_list(ticks: list[str], years: int, price_min: float, price_max: f
         out = pd.DataFrame(near_rows).sort_values(["Score","Avg$Vol(20d, M)","RSI14"], ascending=[False,False,False]).head(20).reset_index(drop=True)
         out.insert(0,"Rank",np.arange(1,len(out)+1)); return out, stats
     return pd.DataFrame(), stats
-
 
 # ---------------- Seasonality & News helpers ----------------
 def _prep_series_for_ts(df: pd.DataFrame) -> pd.Series:
@@ -499,7 +487,7 @@ def _get_vader():
 
 def fetch_rss_headlines(ticker: str, limit: int = 12):
     feeds = [
-        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
+        f"https://feeds.finance.yahoo.com/rss/2.0headline?s={ticker}&region=US&lang=en-US".replace("2.0headline","2.0/headline"),
         f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en",
     ]
     out = []
@@ -574,13 +562,12 @@ with st.sidebar:
     debug_scan   = st.checkbox("Show scanner debug", value=False, key="scan_debug")
     run_market_scan = st.button("Scan Market", key="btn_scan_market")
 
-   
-
 # ---------------- Top Buttons ----------------
 if st.button("Analyze", key="btn_analyze"):
     st.session_state.ran = True
 st.button("New analysis (reset)", key="btn_reset",
-          on_click=lambda: st.session_state.update(ran=False, last_ai="", last_ai_ts=0.0))
+          on_click=lambda: st.session_state.update(ran=False))
+
 # ---------------- Watchlist Screener output ----------------
 if run_screen:
     tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
@@ -590,7 +577,8 @@ if run_screen:
         rows = []
         for t in tickers:
             sdf = load_data(t, years=screen_years)
-            if sdf.empty: continue
+            if sdf.empty: 
+                continue
             sdf = build_indicators(sdf); last = sdf.iloc[-1]
             close = float(last["Close"])
             trend_up = bool(last["EMA20"] > last["EMA50"])
@@ -703,7 +691,7 @@ if st.session_state.ran:
     except Exception as e:
         st.warning(f"ML section error: {e}")
 
-    # -------- NEW: Seasonality & News Context --------
+    # -------- Seasonality & News Context --------
     st.subheader("Seasonality & News Context (experimental)")
     try:
         # Seasonality
@@ -774,30 +762,5 @@ if st.session_state.ran:
     with cdl1: st.download_button("Download TXT",  data=txt_bytes,  file_name=f"{ticker.upper()}_ticket.txt",  mime="text/plain",        key="dl_txt")
     with cdl2: st.download_button("Download JSON", data=json_bytes, file_name=f"{ticker.upper()}_ticket.json", mime="application/json",    key="dl_json")
     with cdl3: st.download_button("Download CSV",  data=csv_bytes,  file_name=f"{ticker.upper()}_ticket.csv",  mime="text/csv",            key="dl_csv")
-
-    st.subheader("Plan explainer")
-    st.markdown(explain_plan(ticker, trend_up, entry_style, plan["entry"], plan["stop"], plan["target"],
-                             float(latest["RSI14"]), atr_val, ema20, ema50, hh20, ll20))
-
-    MIN_GAP:
-                wait = int(MIN_GAP - (now - st.session_state.last_ai_ts))
-                st.info(f"Cooling down... try again in ~{wait}s.")
-            else:
-                system = "You are a helpful swing-trading assistant. Be brief and practical. Never give financial advice; this is educational only."
-                context = (f"Ticker: {ticker.upper()}\nBias: {'LONG' if trend_up else 'SHORT'}\n"
-                           f"Entry style: {entry_style}\nEntry: {plan['entry']:.2f}\n"
-                           f"Stop: {plan['stop']:.2f}\nTarget: {plan['target']:.2f}\n"
-                           f"Shares: {plan['shares']}\nATR14: {atr_val:.2f}\nRSI14: {float(latest['RSI14']):.2f}\n"
-                           f"EMA20: {ema20:.2f}  EMA50: {ema50:.2f}\n20d Range: {ll20:.2f} -> {hh20:.2f}\n"
-                           f"Reminder: educational only, not advice.")
-                user_msg = f"{q}\n\nContext:\n{context}"
-                model = locals().get("model_name","llama3.2:1b")
-                if ollama_available():
-                    st.session_state.last_ai = ask_local_llm(model, system, user_msg)
-                else:
-                    st.session_state.last_ai = "(Ollama not running locally.)"
-                st.session_state.last_ai_ts = time.time()
-        if st.session_state.last_ai:
-            st.write(st.session_state.last_ai)
 else:
     st.info("Type a ticker (e.g., AAPL) and press Analyze.")
