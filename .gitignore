@@ -1,0 +1,43 @@
+# ===========================
+# SwingFinder .gitignore
+# ===========================
+
+# --- Environment & Secrets ---
+.env
+*.env
+secrets.toml
+
+# --- Virtual Environment ---
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+
+# --- OS / Editor Files ---
+.DS_Store
+Thumbs.db
+*.log
+*.bak
+*.swp
+*.tmp
+*.cache
+.vscode/
+.idea/
+
+# --- Streamlit / Deployment ---
+.streamlit/config.toml
+.streamlit/secrets.toml
+# (Streamlit Cloud will load secrets from dashboard, not repo)
+
+# --- Data / Output / Misc ---
+*.csv
+*.json
+*.pkl
+*.xlsx
+*.db
+*.sqlite
+logs/
+outputs/
+cache/
