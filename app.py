@@ -992,4 +992,3 @@ st.sidebar.number_input("Risk per Trade (%)", min_value=0.1, max_value=10.0, key
 st.sidebar.number_input("Target R:R Ratio", min_value=0.5, max_value=10.0, step=0.1, key="rr_ratio")
 
 
-
