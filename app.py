@@ -442,7 +442,44 @@ def evaluate_ticker(ticker: str, mode: str, price_min: float, price_max: float, 
 def run_full_scan(mode: str, price_min: float, price_max: float, min_volume: float,
                   max_cards: int) -> list[dict]:
     tickers = tiingo_all_us_tickers(TIINGO_TOKEN)
-    
+
+    # Shuffle to diversify early results & keep UI feeling live
+    random.seed(42)
+    random.shuffle(tickers)
+
+    results: list[dict] = []
+    progress = st.progress(0, text="🔎 Scanning U.S. market…")
+    total = len(tickers)
+    scanned = 0
+
+    for i in range(0, total, BATCH_TICKER_COUNT):
+        if len(results) >= max_cards:
+            break
+        batch = tickers[i:i+BATCH_TICKER_COUNT]
+        with futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = [ex.submit(evaluate_ticker, t, mode, price_min, price_max, min_volume) for t in batch]
+            for f in futures.as_completed(futs):
+                rec = f.result()
+                if rec is not None:
+                    results.append(rec)
+        scanned = min(i + len(batch), total)
+        progress.progress(scanned / total, text=f"🔎 Scanning… {scanned}/{total} tickers | Hits: {len(results)}")
+        time.sleep(REQUEST_PAUSE_S)
+
+    progress.empty()
+
+    # Sort and return
+    def sort_key(r):
+        if r["Setup"] == "Breakout":
+            return (-1, -r["RSI14"], -r["Volume"])
+        if r["Setup"] == "Pullback":
+            return (0, r["BandPos20"], -r["Volume"])
+        return (1, r["Price"])
+    results.sort(key=sort_key)
+    st.write(f"✅ Scan complete — {len(results)} matches found out of {len(tickers)} tickers")
+    return results
+
+
 # ---------------- Helper for Watchlist Screener only ----------------
 def check_ticker_failure_reason(ticker, price_min, price_max, min_volume):
     """Identify why a watchlist ticker failed the filters."""
@@ -464,7 +501,7 @@ def check_ticker_failure_reason(ticker, price_min, price_max, min_volume):
         return "did not qualify based on technical setup"
     except Exception as e:
         return f"error checking failure reason: {e}"
-    
+
 
 # ---------------- Watchlist Screener (detailed reasons for failed tickers) ----------------
 def run_watchlist_scan_only(watchlist, mode, price_min, price_max, min_volume):
@@ -484,7 +521,6 @@ def run_watchlist_scan_only(watchlist, mode, price_min, price_max, min_volume):
                 results.append(rec)
                 debug_log.append(("✅", f"{ticker}: passed all filters"))
             else:
-                # Determine WHY it might have failed
                 reason = check_ticker_failure_reason(ticker, price_min, price_max, min_volume)
                 debug_log.append(("🚫", f"{ticker}: {reason}"))
         except Exception as e:
@@ -496,49 +532,6 @@ def run_watchlist_scan_only(watchlist, mode, price_min, price_max, min_volume):
         debug_log.append(("❌", "No tickers met your criteria."))
     return results, debug_log
 
-
-    # Shuffle to diversify early results & keep UI feeling live
-    random.seed(42)
-    random.shuffle(tickers)
-
-    results: list[dict] = []
-    progress = st.progress(0, text="🔎 Scanning U.S. market…")
-    total = len(tickers)
-    scanned = 0
-
-    # Chunk through tickers so UI stays responsive
-    for i in range(0, total, BATCH_TICKER_COUNT):
-        if len(results) >= max_cards:
-            break
-        batch = tickers[i:i+BATCH_TICKER_COUNT]
-        with futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futs = [ex.submit(evaluate_ticker, t, mode, price_min, price_max, min_volume) for t in batch]
-            for f in futures.as_completed(futs):
-                rec = f.result()
-                # ⚡️ force include whatever comes back, even if partial
-                if rec is not None:
-                    results.append(rec)
-                else:
-                    # light debug to confirm some tickers are being skipped
-                    if random.random() < 0.001:
-                        st.write("🚫 empty card skipped")
-                    if len(results) >= max_cards:
-                        break
-        scanned = min(i + len(batch), total)
-        progress.progress(scanned/total, text=f"🔎 Scanning… {scanned}/{total} tickers | Hits: {len(results)}")
-        time.sleep(REQUEST_PAUSE_S)
-
-    progress.empty()
-    # Sort: Breakout first by RSI, Pullback by BandPos (low first), else by price
-    def sort_key(r):
-        if r["Setup"] == "Breakout":
-            return (-1, -r["RSI14"], -r["Volume"])
-        if r["Setup"] == "Pullback":
-            return (0, r["BandPos20"], -r["Volume"])
-        return (1, r["Price"])
-    results.sort(key=sort_key)
-    st.write(f"✅ Scan complete — {len(results)} matches found out of {len(tickers)} tickers")
-    return results
 
 # ---------------- UI: Controls ----------------
 with st.sidebar:
