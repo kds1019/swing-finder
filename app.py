@@ -442,7 +442,59 @@ def evaluate_ticker(ticker: str, mode: str, price_min: float, price_max: float, 
 def run_full_scan(mode: str, price_min: float, price_max: float, min_volume: float,
                   max_cards: int) -> list[dict]:
     tickers = tiingo_all_us_tickers(TIINGO_TOKEN)
+    
+# ---------------- Helper for Watchlist Screener only ----------------
+def check_ticker_failure_reason(ticker, price_min, price_max, min_volume):
+    """Identify why a watchlist ticker failed the filters."""
+    try:
+        df = fetch_tiingo(ticker, 10)
+        if df.empty:
+            return "no data returned from Tiingo"
 
+        last_close = float(df["Close"].iloc[-1])
+        last_volume = float(df["Volume"].iloc[-1])
+
+        if last_close < price_min:
+            return f"failed price filter (Close ${last_close:.2f} < Min ${price_min})"
+        if last_close > price_max:
+            return f"failed price filter (Close ${last_close:.2f} > Max ${price_max})"
+        if last_volume < min_volume:
+            return f"failed volume filter (Vol {last_volume:,.0f} < {min_volume:,.0f})"
+
+        return "did not qualify based on technical setup"
+    except Exception as e:
+        return f"error checking failure reason: {e}"
+    
+
+# ---------------- Watchlist Screener (detailed reasons for failed tickers) ----------------
+def run_watchlist_scan_only(watchlist, mode, price_min, price_max, min_volume):
+    """Run the screener only for tickers in the user's watchlist, returning results and detailed debug info."""
+    if not watchlist:
+        return [], [("⚠️", "No tickers found in watchlist.")]
+
+    results = []
+    debug_log = []
+    total = len(watchlist)
+    progress = st.progress(0, text=f"🎯 Scanning {total} watchlist symbols...")
+
+    for i, ticker in enumerate(watchlist, start=1):
+        try:
+            rec = evaluate_ticker(ticker, mode, price_min, price_max, min_volume)
+            if rec:
+                results.append(rec)
+                debug_log.append(("✅", f"{ticker}: passed all filters"))
+            else:
+                # Determine WHY it might have failed
+                reason = check_ticker_failure_reason(ticker, price_min, price_max, min_volume)
+                debug_log.append(("🚫", f"{ticker}: {reason}"))
+        except Exception as e:
+            debug_log.append(("⚠️", f"{ticker}: error — {e}"))
+        progress.progress(i / total, text=f"🎯 {i}/{total} scanned | Hits: {len(results)}")
+
+    progress.empty()
+    if not results:
+        debug_log.append(("❌", "No tickers met your criteria."))
+    return results, debug_log
 
 
     # Shuffle to diversify early results & keep UI feeling live
@@ -577,6 +629,69 @@ else:
                     if st.button("🔍 Analyze", key=f"an_{rec['Symbol']}"):
                         st.session_state["analyze_symbol"] = rec["Symbol"]
                         st.toast(f"Sent {rec['Symbol']} to Analyzer", icon="🔍")
+
+# ---------------- Watchlist Screener Results (Main Page) ----------------
+if "watchlist_results" in st.session_state and st.session_state["watchlist_results"]:
+    st.markdown("---")
+    with st.expander("🎯 Watchlist Screener Results", expanded=True):
+        st.caption(f"{len(st.session_state['watchlist_results'])} symbols met your criteria.")
+
+        per_row = 4
+        results = st.session_state["watchlist_results"]
+        rows = math.ceil(len(results) / per_row)
+        for r in range(rows):
+            cols = st.columns(per_row)
+            for j, col in enumerate(cols):
+                idx = r * per_row + j
+                if idx >= len(results):
+                    break
+                rec = results[idx]
+
+                with col:
+                    st.markdown(
+                        f"""
+                        <div style="
+                            border:2px solid {'#22c55e' if rec['Setup']=='Breakout' else ('#3b82f6' if rec['Setup']=='Pullback' else '#9ca3af')};
+                            border-radius:14px;padding:10px;">
+                            <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                                <div style="font-weight:700;font-size:1.15rem">{rec['Symbol']}</div>
+                                <div style="font-weight:600">${rec['Price']:.2f}</div>
+                            </div>
+                            <div style="font-size:0.9rem;opacity:0.9;margin-top:4px;">
+                                Setup: <b>{rec['Setup']}</b> &nbsp;|&nbsp; RSI14: <b>{rec['RSI14']}</b> &nbsp;|&nbsp; Vol: <b>{rec['Volume']:,}</b><br/>
+                                EMA20&gt;EMA50: <b>{'✅' if rec['EMA20>EMA50'] else '❌'}</b> &nbsp;|&nbsp; BandPos20: <b>{rec['BandPos20']}</b> &nbsp;|&nbsp; ATR14: <b>{rec['ATR14']}</b>
+                            </div>
+                            <div style="margin-top:6px;font-size:0.95rem;line-height:1.4;">
+                                🛡️ Stop: <b>${rec['Stop']:.2f}</b><br/>
+                                🎯 <b style="color:#16a34a;">Target: ${rec['Target']:.2f}</b>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                    cA, cB = st.columns(2)
+                    with cA:
+                        if st.button("➕ Watchlist", key=f"wl_watchlist_{rec['Symbol']}"):
+                            if rec["Symbol"] not in st.session_state.watchlist:
+                                st.session_state.watchlist.append(rec["Symbol"])
+                                st.success(f"Added {rec['Symbol']} to watchlist.")
+                            else:
+                                st.info(f"{rec['Symbol']} already on watchlist.")
+                    with cB:
+                        if st.button("🔍 Analyze", key=f"an_watchlist_{rec['Symbol']}"):
+                            st.session_state["analyze_symbol"] = rec["Symbol"]
+                            st.toast(f"Sent {rec['Symbol']} to Analyzer", icon="🔍")
+
+        # ✅ Move this outside the card loop (but still inside the expander)
+        debug_log = st.session_state.get("watchlist_debug", [])
+        if debug_log:
+            st.markdown("---")
+            st.markdown("### 📋 Debug Log (Watchlist Screener)")
+            for icon, msg in debug_log:
+                st.write(f"{icon} {msg}")
+
+
 
 # =========================================================================================================
 
@@ -763,8 +878,27 @@ with st.sidebar.expander("📂 Watchlist"):
                 ] = []
                 save_watchlists_to_gist(st.session_state.watchlists)
                 st.warning("Cleared and synced watchlist.")
-        else:
-            st.info("Your watchlist is empty.")
+                
+        # --- Watchlist Screener trigger ---
+        if st.button("🎯 Run Watchlist Screener", use_container_width=True):
+            if not st.session_state.watchlist:
+                st.warning("⚠️ Your watchlist is empty.")
+            else:
+                with st.spinner(f"Scanning {len(st.session_state.watchlist)} symbols..."):
+                    results, debug_log = run_watchlist_scan_only(
+                        st.session_state.watchlist,
+                        mode,
+                        price_min,
+                        price_max,
+                        min_volume,
+                    )
+                st.session_state["watchlist_results"] = results
+                st.session_state["watchlist_debug"] = debug_log
+                st.session_state["show_watchlist_results"] = True
+                st.rerun()
+
+
+
 
 
 # ---------------- Analyzer ----------------
