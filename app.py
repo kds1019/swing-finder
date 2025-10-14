@@ -17,6 +17,8 @@ import os, requests
 import json
 
 
+
+
 # ---------------- Streamlit setup ----------------
 st.set_page_config(page_title="SwingFinder", layout="wide")
 
@@ -237,12 +239,6 @@ def tiingo_all_us_tickers(token: str) -> list[str]:
     # dedupe and sort
     clean = sorted(set(all_tickers))
     return clean
-
-
-if st.button("🧪 Test Tiingo Ticker Fetch"):
-    tickers = tiingo_all_us_tickers(TIINGO_TOKEN)
-    st.write(f"Fetched {len(tickers)} tickers. Example:", tickers[:10])
-
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
@@ -582,113 +578,209 @@ else:
                         st.session_state["analyze_symbol"] = rec["Symbol"]
                         st.toast(f"Sent {rec['Symbol']} to Analyzer", icon="🔍")
 
-# Optional: show quick watchlist preview
-if st.session_state.watchlist:
-    with st.expander(f"📜 Watchlist ({len(st.session_state.watchlist)})"):
-        st.write(", ".join(st.session_state.watchlist))
 # =========================================================================================================
 
-
-# ---------- Watchlist (session + save/load + analyzer integration) ----------
+# ---------- Multi-Watchlist Gist System (No Default) ----------
 import requests, json
 
-def load_watchlist_from_gist():
-    """Load the saved watchlist from your GitHub Gist (set up in secrets)."""
+# ----------------- Gist Helpers -----------------
+def load_watchlists_from_gist():
+    """Load all saved watchlists (dict of {name: [tickers]}) from GitHub Gist."""
     try:
         token = st.secrets.get("GITHUB_GIST_TOKEN", "")
         gist_id = st.secrets.get("GIST_ID", "")
         if not token or not gist_id:
-            return []
+            st.warning("⚠️ Missing Gist credentials.")
+            return {}
+
         url = f"https://api.github.com/gists/{gist_id}"
         headers = {"Authorization": f"token {token}"}
         r = requests.get(url, headers=headers, timeout=10)
         if not r.ok:
-            return []
-        files = r.json().get("files", {})
-        content = list(files.values())[0]["content"]
-        return json.loads(content)
-    except Exception as e:
-        st.warning(f"⚠️ Could not load watchlist from Gist: {e}")
-        return []
+            st.warning(f"⚠️ Gist fetch failed ({r.status_code})")
+            return {}
 
-def save_watchlist_to_gist(watchlist):
-    """Save current watchlist to your GitHub Gist."""
+        files = r.json().get("files", {})
+        if not files:
+            return {}
+
+        content = list(files.values())[0]["content"]
+        data = json.loads(content)
+        if isinstance(data, list):
+            # backward compatible with old single-list format
+            return {"Unnamed": data}
+        return data
+    except Exception as e:
+        st.warning(f"⚠️ Could not load from Gist: {e}")
+        return {}
+
+def save_watchlists_to_gist(watchlists_dict):
+    """Save all watchlists (dict of {name: [tickers]}) to GitHub Gist."""
     try:
         token = st.secrets.get("GITHUB_GIST_TOKEN", "")
         gist_id = st.secrets.get("GIST_ID", "")
         if not token or not gist_id:
             st.warning("⚠️ Missing Gist credentials in secrets.")
             return
+
         url = f"https://api.github.com/gists/{gist_id}"
         headers = {"Authorization": f"token {token}"}
         payload = {
-            "files": {"watchlist.json": {"content": json.dumps(watchlist, indent=2)}}
+            "files": {"watchlist.json": {"content": json.dumps(watchlists_dict, indent=2)}}
         }
         r = requests.patch(url, headers=headers, json=payload, timeout=10)
         if not r.ok:
-            st.warning(f"⚠️ Failed to save watchlist: {r.status_code}")
+            st.warning(f"⚠️ Failed to save watchlists: {r.status_code}")
     except Exception as e:
-        st.warning(f"⚠️ Could not save watchlist: {e}")
+        st.warning(f"⚠️ Could not save to Gist: {e}")
 
-# --- Initialize state from Gist on startup ---
+
+# ----------------- Session Initialization -----------------
+if "watchlists" not in st.session_state:
+    st.session_state.watchlists = load_watchlists_from_gist()
+
+if "active_watchlist" not in st.session_state:
+    keys = list(st.session_state.watchlists.keys())
+    st.session_state.active_watchlist = keys[0] if keys else None
+
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist_from_gist()
-
-with st.sidebar.expander("📂 Watchlist"):
-    add_manual = st.text_input("Add Symbol")
-    if st.button("Add to Watchlist") and add_manual:
-        sym = add_manual.strip().upper()
-        if sym and sym not in st.session_state.watchlist:
-            st.session_state.watchlist.append(sym)
-            save_watchlist_to_gist(st.session_state.watchlist)
-            st.success(f"Added {sym} and saved to cloud.")
-        else:
-            st.info(f"{sym} already in watchlist.")
-
-    if st.button("Clear Watchlist"):
-        st.session_state.watchlist = []
-        save_watchlist_to_gist(st.session_state.watchlist)
-        st.warning("Cleared and synced watchlist.")
-
-    # --- Send to Analyzer ---
-    if st.session_state.watchlist:
-        st.markdown("---")
-        pick_symbol = st.selectbox(
-            "Select a symbol to analyze",
-            st.session_state.watchlist,
-            key="wl_analyze_pick",
+    if st.session_state.active_watchlist:
+        st.session_state.watchlist = st.session_state.watchlists.get(
+            st.session_state.active_watchlist, []
         )
-        if st.button("🔍 Send to Analyzer", key="wl_analyze_send"):
-            st.session_state["analyze_symbol"] = pick_symbol
-            st.success(f"Sent {pick_symbol} to Analyzer.")
+    else:
+        st.session_state.watchlist = []
 
-        # --- Download / Upload (optional backup) ---
-        wl_json = json.dumps(st.session_state.watchlist, indent=2)
-        st.download_button("⬇️ Download JSON", wl_json, file_name="watchlist.json")
 
-        up = st.file_uploader("⬆️ Upload JSON", type=["json"])
-        if up is not None:
-            try:
-                loaded = json.loads(up.read().decode("utf-8"))
-                if isinstance(loaded, list):
-                    st.session_state.watchlist = sorted(
-                        set([s.strip().upper() for s in loaded if isinstance(s, str)])
-                    )
-                    save_watchlist_to_gist(st.session_state.watchlist)
-                    st.success("Watchlist uploaded and synced.")
-            except Exception as e:
-                st.warning(f"Could not load file: {e}")
+# ----------------- Sidebar Watchlist Manager -----------------
+with st.sidebar.expander("📂 Watchlist"):
+    st.markdown("### Watchlist Manager")
 
-st.sidebar.caption(
-    f"📈 Watchlist: {', '.join(st.session_state.watchlist) if st.session_state.watchlist else '—'}"
-)
+    all_names = list(st.session_state.watchlists.keys())
+    if not all_names:
+        st.info("No watchlists yet — create one below 👇")
+        selected_name = "➕ Create New"
+    else:
+        selected_name = st.selectbox(
+            "Active Watchlist",
+            options=all_names + ["➕ Create New"],
+            index=all_names.index(st.session_state.active_watchlist)
+            if st.session_state.active_watchlist in all_names
+            else len(all_names),
+        )
+        
+    # 🗑️ Delete current watchlist (with working confirmation)
+    if selected_name not in ["➕ Create New"] and all_names:
+        with st.expander("⚠️ Delete This Watchlist"):
+            st.warning(f"Deleting '{selected_name}' will permanently remove it from cloud storage.")
+            if st.button(f"🗑️ Confirm Delete '{selected_name}'", key=f"confirm_delete_{selected_name}"):
+                try:
+                    del st.session_state.watchlists[selected_name]
+                    save_watchlists_to_gist(st.session_state.watchlists)
+                    st.session_state.active_watchlist = None
+                    st.session_state.watchlist = []
+                    st.success(f"✅ Watchlist '{selected_name}' deleted successfully.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete '{selected_name}': {e}")
+
+    
+
+    # --- Create New Watchlist ---
+    if selected_name == "➕ Create New":
+        new_name = st.text_input("New watchlist name:")
+        if st.button("Create Watchlist"):
+            if new_name.strip():
+                new_name = new_name.strip()
+                st.session_state.watchlists[new_name] = []
+                st.session_state.active_watchlist = new_name
+                st.session_state.watchlist = []
+                save_watchlists_to_gist(st.session_state.watchlists)
+                st.success(f"Created new watchlist: '{new_name}'")
+                st.rerun()
+
+    else:
+        # Load selected watchlist
+        st.session_state.active_watchlist = selected_name
+        st.session_state.watchlist = st.session_state.watchlists.get(selected_name, [])
+
+        # --- Add Symbols ---
+        add_manual = st.text_input(
+            "Add Symbol(s)",
+            placeholder="e.g. AAPL or AAPL, MSFT, TSLA",
+            key="wl_add_symbol",
+        )
+        if st.button("Add to Watchlist"):
+            if add_manual:
+                symbols = [
+                    s.strip().upper()
+                    for s in add_manual.replace(",", " ").split()
+                    if s.strip()
+                ]
+                new_syms = [s for s in symbols if s not in st.session_state.watchlist]
+                if new_syms:
+                    st.session_state.watchlist.extend(new_syms)
+                    st.session_state.watchlists[
+                        st.session_state.active_watchlist
+                    ] = st.session_state.watchlist
+                    save_watchlists_to_gist(st.session_state.watchlists)
+                    st.success(f"Added: {', '.join(new_syms)}")
+                    st.rerun()
+                else:
+                    st.info("All entered symbols already exist.")
+                            
+
+        # --- Display Watchlist (Dropdown Layout) ---
+        if st.session_state.watchlist:
+            st.markdown("---")
+            st.markdown(f"**Current Watchlist ({len(st.session_state.watchlist)})**")
+
+            selected = st.selectbox(
+                "Pick a ticker",
+                options=st.session_state.watchlist,
+                key="wl_pick_for_actions",
+            )
+
+            c1, c2, c3 = st.columns([2, 2, 3])
+            if c1.button("🔍 Analyze", key="wl_analyze_selected"):
+                st.session_state["analyze_symbol"] = selected
+                st.toast(f"Sent {selected} to Analyzer", icon="🔍")
+                st.rerun()
+
+            if c2.button("❌ Remove", key="wl_remove_selected"):
+                st.session_state.watchlist.remove(selected)
+                st.session_state.watchlists[
+                    st.session_state.active_watchlist
+                ] = st.session_state.watchlist
+                save_watchlists_to_gist(st.session_state.watchlists)
+                st.toast(f"Removed {selected}", icon="❌")
+                st.rerun()
+
+            if st.button("🗑️ Clear Watchlist"):
+                st.session_state.watchlist = []
+                st.session_state.watchlists[
+                    st.session_state.active_watchlist
+                ] = []
+                save_watchlists_to_gist(st.session_state.watchlists)
+                st.warning("Cleared and synced watchlist.")
+        else:
+            st.info("Your watchlist is empty.")
 
 
 # ---------------- Analyzer ----------------
 st.subheader("🔍 Analyzer — with RSI, MACD, ATR")
-symbol = st.text_input("Symbol", "AAPL").upper()
-run_analysis = st.button("Analyze")
 
+# Use symbol from session if sent, otherwise default to AAPL
+default_symbol = st.session_state.get("analyze_symbol", "AAPL")
+symbol = st.text_input("Symbol", default_symbol or "AAPL").upper()
+
+# If a new symbol is entered manually, update the session state
+if symbol != st.session_state.get("analyze_symbol"):
+    st.session_state["analyze_symbol"] = symbol
+
+# Auto-run analyzer when ticker was sent from Watchlist or Scanner
+auto_trigger = st.session_state.get("analyze_symbol") == symbol
+run_analysis = st.button("Analyze") or auto_trigger
 
 if run_analysis:
     df = fetch_tiingo(symbol, years)
@@ -927,64 +1019,7 @@ if run_analysis:
 # ---------------- Trade Planner (Moved to Sidebar) ----------------
 st.sidebar.divider()
 st.sidebar.subheader("🧾 Trade Planner Settings")
-# ---------------- Manual Tiingo fetch test ----------------
-if st.sidebar.button("🧩 Direct Tiingo Test (AAPL)"):
-    import datetime as dt
-    start = (dt.date.today() - dt.timedelta(days=60)).isoformat()
-    url = "https://api.tiingo.com/tiingo/daily/aapl/prices"
-    params = {"token": TIINGO_TOKEN, "startDate": start, "resampleFreq": "daily", "format": "json"}
-    r = requests.get(url, params=params)
-    st.write("Status code:", r.status_code)
-    try:
-        st.json(r.json())
-    except Exception as e:
-        st.error(f"Error parsing JSON: {e}")
-...  # end of tiingo_history() function
 
-# ---------------- Manual Tiingo fetch test ----------------
-if st.sidebar.button("🧩 Direct Tiingo Test (AAPL)", key="tiingo_test"):
-    import datetime as dt
-    start = (dt.date.today() - dt.timedelta(days=60)).isoformat()
-    url = "https://api.tiingo.com/tiingo/daily/aapl/prices"
-    params = {"token": TIINGO_TOKEN, "startDate": start, "resampleFreq": "daily", "format": "json"}
-    r = requests.get(url, params=params)
-    st.write("Status code:", r.status_code)
-    try:
-        st.json(r.json())
-    except Exception as e:
-        st.error(f"Error parsing JSON: {e}")
-
-
-# ---------------- Debugging Buttons ----------------
-st.sidebar.header("🧪 Debug Tools")
-
-# 1️⃣ — Test Tiingo fetch directly via your function
-if st.sidebar.button("🔍 Test Single Fetch: AAPL", key="test_fetch"):
-    df_test = tiingo_history("AAPL", TIINGO_TOKEN, SCAN_LOOKBACK_DAYS)
-    if df_test is not None:
-        st.write("✅ Tiingo returned data for AAPL — rows:", len(df_test))
-        st.dataframe(df_test.tail(5))
-    else:
-        st.error("❌ Tiingo returned None or empty DataFrame for AAPL")
-
-# 2️⃣ — Test indicator calculations
-if st.sidebar.button("🛠 Test Indicators on AAPL", key="test_indicators"):
-    df2 = tiingo_history("AAPL", TIINGO_TOKEN, SCAN_LOOKBACK_DAYS)
-    if df2 is not None and len(df2) >= 60:
-        df2 = compute_indicators(df2)
-        st.write("✅ Indicator columns added, sample last rows:")
-        st.dataframe(df2.tail(3))
-    else:
-        st.warning("⚠️ Data too short or failed fetch")
-
-# 3️⃣ — Test full evaluation pipeline
-if st.sidebar.button("📦 Test Evaluate AAPL", key="test_eval"):
-    rec = evaluate_ticker("AAPL", "Both", 1, 500, 10000)
-    if rec:
-        st.success("✅ evaluate_ticker() produced result card:")
-        st.json(rec)
-    else:
-        st.error("❌ evaluate_ticker() returned None")
 
 # Use session state only — no duplicate defaults
 st.sidebar.number_input("Account Size ($)", min_value=0.0, key="account_size")
