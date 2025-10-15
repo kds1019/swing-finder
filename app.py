@@ -619,7 +619,7 @@ else:
                         else:
                             st.info(f"{rec['Symbol']} already on watchlist.")
                 with cB:
-                    if st.button("🔍 Send to Analyzer", key=f"an_{rec['Symbol']}"):
+                    if st.button("🔍 Send to Analyzer", key=f"scan_an_{rec['Symbol']}"):
                         # --- Connection bridge between Screener/Watchlist → Analyzer ---
                         st.session_state["analyze_symbol"] = rec["Symbol"]
                         st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode", "Both"))
@@ -682,7 +682,7 @@ if "watchlist_results" in st.session_state and st.session_state["watchlist_resul
                             else:
                                 st.info(f"{rec['Symbol']} already on watchlist.")
                     with cB:
-                        if st.button("🔍 Send to Analyzer", key=f"an_{rec['Symbol']}"):
+                        if st.button("🔍 Send to Analyzer", key=f"wl_an_{rec['Symbol']}"):
                             # --- Connection bridge between Screener/Watchlist → Analyzer ---
                             st.session_state["analyze_symbol"] = rec["Symbol"]
                             st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode", "Both"))
