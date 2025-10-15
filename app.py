@@ -693,7 +693,7 @@ if "watchlist_results" in st.session_state and st.session_state["watchlist_resul
 
                             # If you're running everything on one page (tabs or expanders),
                             # you can just trigger the Analyzer rerun:
-                            st.experimental_rerun()
+                            st.rerun()
 
 
         # ✅ Move this outside the card loop (but still inside the expander)
