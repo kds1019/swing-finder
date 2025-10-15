@@ -619,9 +619,19 @@ else:
                         else:
                             st.info(f"{rec['Symbol']} already on watchlist.")
                 with cB:
-                    if st.button("🔍 Analyze", key=f"an_{rec['Symbol']}"):
+                    if st.button("🔍 Send to Analyzer", key=f"an_{rec['Symbol']}"):
+                        # --- Connection bridge between Screener/Watchlist → Analyzer ---
                         st.session_state["analyze_symbol"] = rec["Symbol"]
-                        st.toast(f"Sent {rec['Symbol']} to Analyzer", icon="🔍")
+                        st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode", "Both"))
+                        st.session_state["setup_mode"] = rec.get("Setup", "Both")  # keep global consistent
+
+                        # If your app uses multipage navigation:
+                        # st.switch_page("Analyzer")
+
+                        # If you're running everything on one page (tabs or expanders),
+                        # you can just trigger the Analyzer rerun:
+                        st.experimental_rerun()
+
 
 # ---------------- Watchlist Screener Results (Main Page) ----------------
 if "watchlist_results" in st.session_state and st.session_state["watchlist_results"]:
@@ -672,9 +682,19 @@ if "watchlist_results" in st.session_state and st.session_state["watchlist_resul
                             else:
                                 st.info(f"{rec['Symbol']} already on watchlist.")
                     with cB:
-                        if st.button("🔍 Analyze", key=f"an_watchlist_{rec['Symbol']}"):
+                        if st.button("🔍 Send to Analyzer", key=f"an_{rec['Symbol']}"):
+                            # --- Connection bridge between Screener/Watchlist → Analyzer ---
                             st.session_state["analyze_symbol"] = rec["Symbol"]
-                            st.toast(f"Sent {rec['Symbol']} to Analyzer", icon="🔍")
+                            st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode", "Both"))
+                            st.session_state["setup_mode"] = rec.get("Setup", "Both")  # keep global consistent
+
+                            # If your app uses multipage navigation:
+                            # st.switch_page("Analyzer")
+
+                            # If you're running everything on one page (tabs or expanders),
+                            # you can just trigger the Analyzer rerun:
+                            st.experimental_rerun()
+
 
         # ✅ Move this outside the card loop (but still inside the expander)
         debug_log = st.session_state.get("watchlist_debug", [])
@@ -1098,54 +1118,138 @@ if run_analysis:
 
 
         
-        # --- Trade Planning (integrated into Analyzer) ---
+                        # --- Trade Planning (smart-aggressive, recency & sanity guards) ---
         st.divider()
         st.subheader("🧾 Trade Plan")
-        
-        # --- Safe fetch of risk settings from session or fallback defaults ---
+
+        # --- Risk settings ---
         account = float(st.session_state.get("account_size", 10_000.0))
         risk_pct = float(st.session_state.get("risk_per_trade", 1.0))
         rr_ratio = float(st.session_state.get("rr_ratio", 2.0))
 
-        # Extract analyzer data
-        last = df.iloc[-1]
-        close = float(last["Close"])
-        atr = float(last.get("ATR14", np.nan))
+        # Prefer setup sent from Screener/Watchlist; else fall back
+        setup_mode = st.session_state.get("sent_setup") or st.session_state.get("setup_mode", "Both")
 
-        # Compute stop and target
-        stop = close - atr * 1.5 if not np.isnan(atr) else close * 0.97
-        target = close + (close - stop) * rr_ratio
+        # --- Signal definitions ---
+        df = df.copy()
+        ema20 = df["EMA20"]
+        atr14 = df["ATR14"]
+        last_close = float(df["Close"].iloc[-1])
 
-        # Risk management
-        risk_amt = account * (risk_pct / 100)
-        risk_per_share = close - stop
-        shares = int(risk_amt / risk_per_share) if risk_per_share > 0 else 0
-        reward = (target - close) * shares
-        eta_days = (target - close) / (0.8 * atr) if atr and atr > 0 else np.nan
+        # Breakout = cross up through EMA20
+        df["BreakoutSig"] = (df["Close"] > ema20) & (df["Close"].shift(1) <= ema20.shift(1))
 
-        # Display metrics in grid
+        # Smart-aggressive Pullback = EMA20 rising, prior bar below EMA20, now close back above, and within 3% of EMA20
+        recent_up = ema20 > ema20.shift(5)
+        df["PullbackSig"] = (
+            recent_up &
+            (df["Close"].shift(1) < ema20.shift(1)) &
+            (df["Close"] > ema20) &
+            ((df["Close"] - ema20).abs() / ema20 <= 0.03)
+        )
+
+        # --- Recency guard: only consider signals from the last N bars ---
+        RECENT_BARS = 50
+        recent_idx = set(df.index[-RECENT_BARS:].tolist())
+        breakout_idxs = [i for i in df.index[df["BreakoutSig"]].tolist() if i in recent_idx]
+        pullback_idxs = [i for i in df.index[df["PullbackSig"]].tolist() if i in recent_idx]
+
+        # --- Choose entry candle by setup ---
+        entry_row, entry_signal = None, "Recent Close"
+        if setup_mode == "Breakout" and breakout_idxs:
+            entry_row = df.loc[breakout_idxs[-1]]
+            entry_signal = "Breakout"
+        elif setup_mode == "Pullback" and pullback_idxs:
+            entry_row = df.loc[pullback_idxs[-1]]
+            entry_signal = "Pullback"
+        elif setup_mode == "Both":
+            if pullback_idxs:
+                entry_row = df.loc[pullback_idxs[-1]]; entry_signal = "Pullback"
+            elif breakout_idxs:
+                entry_row = df.loc[breakout_idxs[-1]]; entry_signal = "Breakout"
+
+        if entry_row is None:
+            entry_row = df.iloc[-1]  # graceful fallback
+
+        entry_price = float(entry_row["Close"])
+        atr = float(entry_row.get("ATR14", np.nan))
+        ema20_now = float(ema20.iloc[-1])
+
+        # --- Sanity guard: if entry is >15% away from current price, use recent close instead ---
+        if abs(entry_price - last_close) / max(1e-6, last_close) > 0.15:
+            entry_price = last_close
+            entry_signal = f"{entry_signal} (sanity fallback)"
+
+        # --- Stops: swing-low or (EMA20 - 1.3*ATR), whichever is lower; with fallback if ATR missing ---
+        swing_low = float(df["Low"].tail(10).min())
+        if not np.isnan(atr) and atr > 0:
+            atr_stop = ema20_now - 1.3 * atr
+            proposed_stop = min(swing_low, atr_stop)
+            if proposed_stop >= entry_price:
+                proposed_stop = entry_price - 1.2 * atr  # rare edge case
+        else:
+            proposed_stop = entry_price * 0.97
+        stop = max(0.01, proposed_stop)
+
+        # --- Target: R-multiple vs recent swing-high (take farther if above entry) ---
+        risk_per_share = max(1e-6, entry_price - stop)
+        rr_target = entry_price + rr_ratio * risk_per_share
+        prior_high = float(df["High"].tail(10).max())
+        target = max(rr_target, prior_high) if prior_high > entry_price else rr_target
+
+        # --- Sizing & reward ---
+        risk_amt = account * (risk_pct / 100.0)
+        shares = int(risk_amt // risk_per_share) if risk_per_share > 0 else 0
+        reward = (target - entry_price) * shares
+
+        # --- ETA: more realistic pace ---
+        avg_abs_diff = df["Close"].diff().abs().tail(20).mean()
+        if atr and atr > 0:
+            pace = float(max(avg_abs_diff if pd.notna(avg_abs_diff) else 0.0, 0.7 * atr))
+        else:
+            pace = float(avg_abs_diff) if pd.notna(avg_abs_diff) else np.nan
+        eta_days = (target - entry_price) / pace if (pace and pace > 0) else np.nan
+
+        # --- Display (same layout you had) ---
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("Entry Price", f"${close:.2f}")
-            st.metric("Stop Loss", f"${stop:.2f}")
+            st.metric("Setup Type", entry_signal)
+            st.metric("Entry Price", f"${entry_price:.2f}")
         with c2:
+            st.metric("Stop Loss", f"${stop:.2f}")
             st.metric("Target Price", f"${target:.2f}")
-            st.metric("R:R Ratio", f"{rr_ratio:.2f}")
         with c3:
+            st.metric("R:R Ratio", f"{rr_ratio:.2f}")
             st.metric("Shares to Buy", f"{shares}")
-            st.metric("Total Risk ($)", f"{risk_amt:,.2f}")
         with c4:
             st.metric("ETA to Target", f"{eta_days:.1f} days" if not np.isnan(eta_days) else "—")
             st.metric("Potential Reward ($)", f"{reward:,.2f}")
 
-        st.caption("Trade plan estimates use ATR(14) volatility and your sidebar risk settings.")
+        st.caption(
+            "Smart-aggressive: use only fresh signals (≤50 bars), pullback reclaims ≤3% above EMA20, "
+            "and sanity-fallback if entry drifts >15% from market. ETA uses max(20-bar avg move, 0.7×ATR)."
+        )
 
-    else:
-        st.error("No Tiingo data found for that symbol.")
+        # --- Optional diagnostics (expand to verify decisions) ---
+        with st.expander("🧪 Diagnostics"):
+            chosen_idx = int(entry_row.name) if hasattr(entry_row, "name") else None
+            st.write({
+                "setup_mode": setup_mode,
+                "entry_signal": entry_signal,
+                "entry_index": chosen_idx,
+                "bars_back": (len(df) - 1 - chosen_idx) if chosen_idx is not None else None,
+                "entry_price": entry_price,
+                "last_close": last_close,
+                "ema20_now": ema20_now,
+                "atr": atr,
+                "risk_per_share": risk_per_share,
+                "pace_for_eta": pace,
+                "eta_days": float(eta_days) if not np.isnan(eta_days) else None
+            })
 
-# ---------------- Trade Planner (Moved to Sidebar) ----------------
-st.sidebar.divider()
-st.sidebar.subheader("🧾 Trade Planner Settings")
+
+
+
 
 
 # Use session state only — no duplicate defaults
