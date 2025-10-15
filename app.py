@@ -630,7 +630,7 @@ else:
 
                         # If you're running everything on one page (tabs or expanders),
                         # you can just trigger the Analyzer rerun:
-                        st.experimental_rerun()
+                        st.rerun()
 
 
 # ---------------- Watchlist Screener Results (Main Page) ----------------
