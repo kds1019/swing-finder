@@ -373,6 +373,30 @@ def passes_filters(last, price_min, price_max, min_volume, mode="Both") -> bool:
         print(f"⚠️ passes_filters error: {e}")
         return False
 
+# ---------------- Setup Guidance Helper ----------------
+def setup_guidance_text(setup_type: str) -> str:
+    """Return entry guidance text based on setup type."""
+    if setup_type == "Breakout":
+        return (
+            "💥 **Breakout Setup** — Watch for price **breaking above resistance** on "
+            "strong volume. Enter **after** a confirmed close above the breakout zone. "
+            "Stop just below the breakout base or last consolidation low."
+        )
+    elif setup_type == "Pullback":
+        return (
+            "📉 **Pullback Setup** — Wait for the dip to **stabilize near support or VWAP**, "
+            "then look for a **green reversal candle** with increasing volume. "
+            "Enter above that candle’s high; stop below the swing low."
+        )
+    elif setup_type == "Recent Close":
+        return (
+            "⏸ **Recent Close Setup** — Setup is neutral today. Wait for **next-day "
+            "confirmation** above yesterday’s high before entry. Avoid entering early "
+            "until strength is confirmed with volume."
+        )
+    else:
+        return "🧭 Setup guidance unavailable."
+
 
 
 # ---------------- Single ticker evaluation ----------------
