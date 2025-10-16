@@ -395,9 +395,9 @@ def setup_guidance_text(setup_type: str) -> str:
             "until strength is confirmed with volume."
         )
     else:
-        return "🧭 Setup guidance unavailable."
+        return "🧭 Setup guidance unavailable." 
 
-
+ 
 
 # ---------------- Single ticker evaluation ----------------
 def evaluate_ticker(ticker: str, mode: str, price_min: float, price_max: float, min_volume: float) -> dict | None:
@@ -1257,7 +1257,7 @@ if run_analysis:
 
         # 💡 Setup guidance expander
         with st.expander("💡 How to Trade This Setup", expanded=True):
-            st.markdown(setup_guidance_text(setup_type))
+           st.markdown(setup_guidance_text(entry_signal))
 
 
 
