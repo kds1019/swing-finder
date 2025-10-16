@@ -373,30 +373,44 @@ def passes_filters(last, price_min, price_max, min_volume, mode="Both") -> bool:
         print(f"⚠️ passes_filters error: {e}")
         return False
 
-# ---------------- Setup Guidance Helper ----------------
-def setup_guidance_text(setup_type: str) -> str:
-    """Return entry guidance text based on setup type."""
-    if setup_type == "Breakout":
-        return (
-            "💥 **Breakout Setup** — Watch for price **breaking above resistance** on "
-            "strong volume. Enter **after** a confirmed close above the breakout zone. "
-            "Stop just below the breakout base or last consolidation low."
-        )
-    elif setup_type == "Pullback":
-        return (
-            "📉 **Pullback Setup** — Wait for the dip to **stabilize near support or VWAP**, "
-            "then look for a **green reversal candle** with increasing volume. "
-            "Enter above that candle’s high; stop below the swing low."
-        )
-    elif setup_type == "Recent Close":
-        return (
-            "⏸ **Recent Close Setup** — Setup is neutral today. Wait for **next-day "
-            "confirmation** above yesterday’s high before entry. Avoid entering early "
-            "until strength is confirmed with volume."
-        )
-    else:
-        return "🧭 Setup guidance unavailable." 
+# ---------------- Setup Guidance Helper (with key level) ----------------
+from typing import Optional
 
+def setup_guidance_text(setup_type: str, key_level: Optional[float] = None) -> str:
+    """
+    Returns entry guidance text based on setup type.
+    If key_level is provided, it appends a support (pullback) or resistance (breakout) hint.
+    """
+    if setup_type == "Breakout":
+        msg = (
+            "💥 **Breakout Setup** — Wait for price to **break and hold above resistance** "
+            "on strong volume. Enter after a confirmed push/close above that zone; "
+            "stop just below the breakout base or last consolidation low."
+        )
+        if key_level is not None:
+            msg += f"\n\n🚀 **Resistance Level:** around **${key_level:.2f}** (recent swing high / breakout zone)"
+        return msg
+
+    elif setup_type == "Pullback":
+        msg = (
+            "📉 **Pullback Setup** — Let the dip **stabilize near support/VWAP**, then "
+            "look for a **green reversal candle** on rising volume. Enter **above the reversal high**; "
+            "stop below the swing low."
+        )
+        if key_level is not None:
+            msg += f"\n\n🧭 **Support Zone:** around **${key_level:.2f}** (recent swing low / EMA20 area)"
+        return msg
+
+    elif setup_type == "Recent Close":
+        msg = (
+            "⏸ **Recent Close Setup** — Neutral today. Look for **next-session confirmation** "
+            "above yesterday’s high with volume before entering."
+        )
+        if key_level is not None:
+            msg += f"\n\n🔎 **Confirmation Trigger:** watch **${key_level:.2f}** (yesterday’s high) for strength."
+        return msg
+
+    return "🧭 Setup guidance unavailable."
  
 
 # ---------------- Single ticker evaluation ----------------
@@ -1199,6 +1213,23 @@ if run_analysis:
         atr = float(entry_row.get("ATR14", np.nan))
         ema20_now = float(ema20.iloc[-1])
 
+        # --- Key level for guidance (support/resistance/confirm) ---
+        LEVEL_LOOKBACK = 10  # tweak if desired (5–20)
+        key_level = None
+
+        if entry_signal == "Pullback":
+            # recent local support: lowest low of last N bars
+            key_level = float(df["Low"].tail(LEVEL_LOOKBACK).min())
+
+        elif entry_signal == "Breakout":
+            # recent resistance: highest high of last N bars
+            key_level = float(df["High"].tail(LEVEL_LOOKBACK).max())
+
+        elif entry_signal.startswith("Recent Close"):
+            # neutral setup: use yesterday's high as confirmation trigger
+            if len(df) >= 2:
+                key_level = float(df["High"].iloc[-2])
+
         # --- Sanity guard: if entry is >15% away from current price, use recent close instead ---
         if abs(entry_price - last_close) / max(1e-6, last_close) > 0.15:
             entry_price = last_close
@@ -1257,7 +1288,7 @@ if run_analysis:
 
         # 💡 Setup guidance expander
         with st.expander("💡 How to Trade This Setup", expanded=True):
-           st.markdown(setup_guidance_text(entry_signal))
+            st.markdown(setup_guidance_text(entry_signal, key_level))
 
 
 
