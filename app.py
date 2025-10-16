@@ -1254,22 +1254,10 @@ if run_analysis:
             "and sanity-fallback if entry drifts >15% from market. ETA uses max(20-bar avg move, 0.7×ATR)."
         )
 
-        # --- Optional diagnostics (expand to verify decisions) ---
-        with st.expander("🧪 Diagnostics"):
-            chosen_idx = int(entry_row.name) if hasattr(entry_row, "name") else None
-            st.write({
-                "setup_mode": setup_mode,
-                "entry_signal": entry_signal,
-                "entry_index": chosen_idx,
-                "bars_back": (len(df) - 1 - chosen_idx) if chosen_idx is not None else None,
-                "entry_price": entry_price,
-                "last_close": last_close,
-                "ema20_now": ema20_now,
-                "atr": atr,
-                "risk_per_share": risk_per_share,
-                "pace_for_eta": pace,
-                "eta_days": float(eta_days) if not np.isnan(eta_days) else None
-            })
+
+        # 💡 Setup guidance expander
+        with st.expander("💡 How to Trade This Setup", expanded=True):
+            st.markdown(setup_guidance_text(setup_type))
 
 
 
