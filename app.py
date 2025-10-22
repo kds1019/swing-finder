@@ -205,13 +205,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------- Tiingo API ----------------
-@st.cache_data(show_spinner=False, ttl=60*60*12)
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)  # refresh every 24 hours
 def tiingo_all_us_tickers(token: str) -> list[str]:
     """
     Fetch all active US tickers from Tiingo via the /utilities/search endpoint.
-    Filters out numeric and non-US tickers.
+    Refreshes once per day (24h TTL). Randomized order for varied scan results.
     """
-    import string, time, requests
+    import string, time, requests, random
 
     url = "https://api.tiingo.com/tiingo/utilities/search"
     headers = {"Content-Type": "application/json"}
@@ -227,18 +227,21 @@ def tiingo_all_us_tickers(token: str) -> list[str]:
         for d in data:
             sym = d.get("ticker", "").upper()
             exch = d.get("exchange", "")
-            # keep only alphabetic U.S. tickers, skip numbers, FX, crypto
             if (
                 sym.isalpha()
                 and d.get("assetType") == "Stock"
                 and exch not in ("CRYPTO", "FX")
             ):
                 all_tickers.append(sym)
-        time.sleep(0.2)
+        time.sleep(0.2)  # polite pacing to avoid 429s
 
-    # dedupe and sort
-    clean = sorted(set(all_tickers))
+    # ✅ dedupe and randomize order
+    clean = list(set(all_tickers))
+    random.shuffle(clean)
+
+    st.write(f"📈 Tiingo universe fetched: {len(clean):,} tickers (refreshed once per day)")
     return clean
+
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
@@ -337,8 +340,6 @@ def classify_setup(last: pd.Series) -> str:
 
 
 # --------------------------------------------------------------
-# Filters — loosened for visibility
-# --------------------------------------------------------------
 def passes_filters(last, price_min, price_max, min_volume, mode="Both") -> bool:
     """Apply meaningful filters to cut down noise, Webull-style."""
     try:
@@ -360,11 +361,11 @@ def passes_filters(last, price_min, price_max, min_volume, mode="Both") -> bool:
         # --- Mode-based logic ---
         if mode == "Breakout":
             # Strong uptrend + momentum
-            return ema20 > ema50 and rsi > 55 and band > 0.6
+            return ema20 > ema50 and rsi > 55 and band > 0.55
 
         elif mode == "Pullback":
-            # Uptrend but short-term dip
-            return ema20 > ema50 and rsi < 55 and band < 0.4
+            # Uptrend but short-term dip near support
+            return ema20 > ema50 and rsi < 60 and band <= 0.45 and px <= ema20
 
         else:  # Both — include anything trending up
             return ema20 > ema50
@@ -372,6 +373,7 @@ def passes_filters(last, price_min, price_max, min_volume, mode="Both") -> bool:
     except Exception as e:
         print(f"⚠️ passes_filters error: {e}")
         return False
+
 
 # ---------------- Setup Guidance Helper (with key level) ----------------
 from typing import Optional
@@ -450,8 +452,23 @@ def evaluate_ticker(ticker: str, mode: str, price_min: float, price_max: float, 
         stop = px - atr * 1.5
         target = px + (px - stop) * 2.0  # 2R target
 
-        # --- Basic setup classification ---
-        setup = "Breakout" if last["EMA20"] > last["EMA50"] else "Pullback"
+        # --- Basic setup classification (based on scan mode or ticker state) ---
+        if mode == "Pullback":
+            setup = "Pullback"
+        elif mode == "Breakout":
+            setup = "Breakout"
+        elif mode == "Both":
+            # classify each ticker dynamically based on indicators
+            if last["EMA20"] > last["EMA50"] and last["RSI14"] > 55 and last["BandPos20"] > 0.55:
+                setup = "Breakout"
+            elif last["EMA20"] > last["EMA50"] and last["RSI14"] < 60 and last["BandPos20"] <= 0.45 and last["Close"] <= last["EMA20"]:
+                setup = "Pullback"
+            else:
+                return None  # skip anything that isn't either setup
+        else:
+            setup = "Unknown"
+
+
 
         # --- Build result card ---
         card = {
@@ -482,7 +499,7 @@ def run_full_scan(mode: str, price_min: float, price_max: float, min_volume: flo
     tickers = tiingo_all_us_tickers(TIINGO_TOKEN)
 
     # Shuffle to diversify early results & keep UI feeling live
-    random.seed(42)
+    random.seed()  # or random.seed(time.time())
     random.shuffle(tickers)
 
     results: list[dict] = []
@@ -574,7 +591,14 @@ def run_watchlist_scan_only(watchlist, mode, price_min, price_max, min_volume):
 # ---------------- UI: Controls ----------------
 with st.sidebar:
     st.subheader("🔧 Market Scanner (Tiingo, U.S.)")
-    mode = st.selectbox("Setup Mode", ["Pullback", "Breakout", "Both"], index=2)
+   # --- Setup Mode Dropdown (persistent in session_state) ---
+    st.session_state["setup_mode"] = st.selectbox(
+        "Setup Mode",
+        ["Pullback", "Breakout", "Both"],
+        index=["Pullback", "Breakout", "Both"].index(st.session_state.get("setup_mode", "Breakout"))
+    )
+    mode = st.session_state["setup_mode"]  # keep local reference for clarity
+
     c1, c2 = st.columns(2)
     with c1:
         price_min = st.number_input("Min Price ($)", value=3.0, min_value=0.0, step=0.5)
@@ -601,10 +625,17 @@ st.caption("All active U.S. equities. Filters: price, volume, and setup mode (Pu
 if run_scan:
     st.session_state["scanner_running"] = True
     with st.spinner("Scanning the U.S. market... this may take 1–2 minutes"):
+        current_mode = st.session_state.get("setup_mode", "Breakout")
+        st.write(f"🧭 Running full scan mode: {current_mode}")  # optional debug line
         st.session_state["scanner_results"] = run_full_scan(
-            mode, price_min, price_max, min_volume, max_cards
+            mode=current_mode,
+            price_min=price_min,
+            price_max=price_max,
+            min_volume=min_volume,
+            max_cards=max_cards
         )
     st.session_state["scanner_running"] = False
+
 
 # safely retrieve results (don’t reset them on rerun)
 results = st.session_state.get("scanner_results", [])
@@ -1299,5 +1330,3 @@ if run_analysis:
 st.sidebar.number_input("Account Size ($)", min_value=0.0, key="account_size")
 st.sidebar.number_input("Risk per Trade (%)", min_value=0.1, max_value=10.0, key="risk_per_trade")
 st.sidebar.number_input("Target R:R Ratio", min_value=0.5, max_value=10.0, step=0.1, key="rr_ratio")
-
-
