@@ -295,6 +295,109 @@ def tiingo_history(ticker: str, token: str, days: int) -> pd.DataFrame | None:
     except Exception as e:
         print(f"❌ Error fetching {ticker}: {e}")
         return None  # ✅ inside except, properly indented
+    
+    # ---------------- Tiingo Sector Metadata ----------------
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def get_tiingo_sector(ticker: str, token: str) -> str:
+    """Fetch sector classification for a ticker from Tiingo metadata."""
+    import requests
+    url = f"https://api.tiingo.com/tiingo/daily/{ticker.lower()}"
+    headers = {"Authorization": f"Token {token}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if not r.ok:
+            print(f"⚠️ Sector fetch failed for {ticker}: {r.status_code}")
+            return "Unknown"
+        data = r.json()
+        sector = data.get("sector", "Unknown")
+        if not sector:
+            sector = "Unknown"
+        return sector
+    except Exception as e:
+        print(f"❌ Error getting sector for {ticker}: {e}")
+        return "Unknown"
+
+# ---------------- Sector Snapshot (EMA20 vs EMA50) ----------------
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def get_sector_snapshot(token: str):
+    """Return quick EMA-based trend snapshot for key sector ETFs."""
+    import pandas as pd
+    import requests
+
+    sectors = {
+        "XLK": "Technology",
+        "XLF": "Financials",
+        "XLE": "Energy",
+        "XLV": "Healthcare",
+        "XLI": "Industrials",
+        "XLY": "Consumer Discretionary",
+        "XLP": "Consumer Staples",
+        "XLB": "Materials",
+        "XLRE": "Real Estate",
+        "XLU": "Utilities",
+        "XLC": "Communication Services",
+    }
+
+    start = (pd.Timestamp.utcnow().date() - pd.Timedelta(days=60)).isoformat()
+    rows = []
+    for sym, name in sectors.items():
+        try:
+            url = f"https://api.tiingo.com/tiingo/daily/{sym.lower()}/prices"
+            headers = {"Authorization": f"Token {token}"}
+            params = {"resampleFreq": "daily", "startDate": start}
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code != 200:
+                continue
+            df = pd.DataFrame(r.json())
+            if df.empty:
+                continue
+            close = df["close"].astype(float)
+            ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            bias = "Uptrend" if ema20 > ema50 else "Downtrend"
+            rows.append({"ETF": sym, "Sector": name, "Bias": bias})
+        except Exception:
+            continue
+
+    return pd.DataFrame(rows)
+
+# ---------------- Market Snapshot (SPY + VIX) ----------------
+import datetime as dt
+import pandas as pd
+import requests
+
+@st.cache_data(ttl=60 * 60 * 6)  # refresh every 6 hours
+def get_market_snapshot(token: str):
+    """Fetch SPY trend and volatility context for Smart Mode."""
+    try:
+        start = (dt.date.today() - dt.timedelta(days=60)).isoformat()
+        url = f"https://api.tiingo.com/tiingo/daily/spy/prices"
+        params = {"token": token, "startDate": start, "resampleFreq": "daily"}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        df = pd.DataFrame(r.json())
+        df["date"] = pd.to_datetime(df["date"])
+        df["EMA20"] = df["close"].ewm(span=20).mean()
+        df["EMA50"] = df["close"].ewm(span=50).mean()
+        df["TR"] = df["close"].diff().abs()
+        df["ATR20"] = df["TR"].rolling(20).mean()
+        atrp = (df["ATR20"].iloc[-1] / df["close"].iloc[-1]) * 100
+
+        bias = "Uptrend" if df["EMA20"].iloc[-1] > df["EMA50"].iloc[-1] else "Downtrend"
+        vol_regime = "High Volatility" if atrp > 2.5 else "Low Volatility"
+
+        return {
+            "bias": bias,
+            "vol_regime": vol_regime,
+            "spy_price": round(df["close"].iloc[-1], 2),
+            "atrp": round(atrp, 2)
+        }
+    except Exception as e:
+        print(f"⚠️ Market snapshot error: {e}")
+        return None
+
+
 
 
 
@@ -417,80 +520,197 @@ def setup_guidance_text(setup_type: str, key_level: Optional[float] = None) -> s
 
 # ---------------- Single ticker evaluation ----------------
 def evaluate_ticker(ticker: str, mode: str, price_min: float, price_max: float, min_volume: float) -> dict | None:
-    """Evaluate a single ticker and return a metrics card."""
+    """Evaluate a single ticker and return a metrics card with trend context + near-miss detection."""
     try:
+                # --- Load Smart Context if active ---
+        market_bias = None
+        vol_regime = None
+        if st.session_state.get("smart_mode", False):
+            market = get_market_snapshot(TIINGO_TOKEN)
+            if market:
+                market_bias = market["bias"]          # "Uptrend" or "Downtrend"
+                vol_regime = market["vol_regime"]    # "High Volatility" / "Low Volatility"
+                
+        if market_bias:
+            st.write(f"🧠 Smart bias active → {market_bias}, Volatility: {vol_regime}")
+
+
+        # --- Fetch & compute indicators ---
         df = tiingo_history(ticker, TIINGO_TOKEN, SCAN_LOOKBACK_DAYS)
         if df is None or len(df) < 60:
-            st.write(f"⚠️ {ticker}: insufficient data ({0 if df is None else len(df)} rows)")
             return None
-
-        st.write(f"📊 {ticker}: fetched {len(df)} rows from Tiingo")
 
         df = compute_indicators(df)
         last = df.iloc[-1]
 
-        # --- Debug: show last row values ---
-        st.write(f"Last row sample for {ticker}:")
-        st.dataframe(last.to_frame().T)
-
-        # --- Apply filters properly ---
         px = float(last["Close"])
         vol = float(last["Volume"])
-        if pd.isna(px) or pd.isna(vol):
+        if pd.isna(px) or pd.isna(vol) or px < price_min or px > price_max or vol < min_volume:
             return None
 
-        # ✅ Apply your price & volume filters (quiet version)
-        if not passes_filters(last, price_min, price_max, min_volume, mode):
-            return None
-
-
-        # --- Temporary defaults for target & stop ---
+        ema20 = float(last["EMA20"])
+        ema50 = float(last["EMA50"])
+        rsi = float(last["RSI14"])
+        band = float(last["BandPos20"])
         atr = float(last.get("ATR14", np.nan))
-        if pd.isna(atr) or atr <= 0:
-            atr = px * 0.01  # fallback: 1% ATR
+        atr = px * 0.01 if pd.isna(atr) or atr <= 0 else atr
+        support = float(last.get("LL20", np.nan))
+        resistance = float(last.get("HH20", np.nan))
+        
+                # --- Dynamic filter tuning based on market bias ---
+        rsi_buffer = 0
+        band_buffer = 0
 
-        stop = px - atr * 1.5
-        target = px + (px - stop) * 2.0  # 2R target
+        if market_bias == "Uptrend":
+            rsi_buffer = +3      # require slightly stronger RSI
+            band_buffer = +0.05  # breakout band higher
+        elif market_bias == "Downtrend":
+            rsi_buffer = -3      # looser RSI requirement (accept early signs)
+            band_buffer = -0.05  # breakout band lower
 
-        # --- Basic setup classification (based on scan mode or ticker state) ---
-        if mode == "Pullback":
-            setup = "Pullback"
-        elif mode == "Breakout":
-            setup = "Breakout"
-        elif mode == "Both":
-            # classify each ticker dynamically based on indicators
-            if last["EMA20"] > last["EMA50"] and last["RSI14"] > 55 and last["BandPos20"] > 0.55:
+        # Example effect: RSI>55 → RSI>(55 + rsi_buffer)
+
+
+        # --- Setup & Near Miss detection ---
+        setup, near_miss, near_type = None, False, None
+
+        if ema20 > ema50:
+            # Confirmed setups
+            if mode in ["Breakout", "Both"] and rsi > (55 + rsi_buffer) and band > (0.55 + band_buffer):
                 setup = "Breakout"
-            elif last["EMA20"] > last["EMA50"] and last["RSI14"] < 60 and last["BandPos20"] <= 0.45 and last["Close"] <= last["EMA20"]:
+            elif mode in ["Pullback", "Both"] and rsi < (60 + rsi_buffer) and band <= (0.45 + band_buffer) and px <= ema20:
                 setup = "Pullback"
-            else:
-                return None  # skip anything that isn't either setup
+
+
+            # Near misses (broader tolerance window)
+            if not setup:
+                near_pct = 15.0       # within 15% of resistance
+                near_atr_mult = 4.0   # within 4×ATR of support
+
+                if mode in ["Breakout", "Both"] and 40 <= rsi <= 67 and 0.35 <= band <= 0.70:
+                    near_miss, near_type = True, "RSI/Band breakout proximity"
+                elif mode in ["Pullback", "Both"] and 40 <= rsi <= 70 and 0.20 <= band <= 0.60:
+                    near_miss, near_type = True, "RSI/Band pullback proximity"
+
+                # Check proximity to recent high/low
+                if pd.notna(resistance) and resistance > 0 and (resistance - px) / resistance <= near_pct / 100:
+                    near_miss, near_type = True, f"≤{near_pct:.0f}% below 20-day high"
+                elif pd.notna(support) and (px - support) <= near_atr_mult * atr:
+                    near_miss, near_type = True, f"≤{near_atr_mult:.1f}×ATR above 20-day low"
+
+        # --- Skip if no signal ---
+        if not setup and not near_miss:
+            return None
+
+        # --- Determine trend context ---
+        if ema20 > ema50 * 1.02:
+            trend_context = "Uptrend"
+        elif ema20 < ema50 * 0.98:
+            trend_context = "Downtrend"
         else:
-            setup = "Unknown"
+            trend_context = "Sideways"
 
+        # --- Combine setup + trend for readable context ---
+        if setup:
+            setup_context = f"{setup} in {trend_context}"
+        elif near_miss:
+            setup_context = f"Potential {near_type or 'setup'} in {trend_context}"
+        else:
+            setup_context = trend_context
 
+        # --- Target / Stop (ATR-based) ---
+        stop = px - atr * 1.5
+        target = px + (px - stop) * 2.0
+        
+                # --- Smart Score calculation ---
+        smart_score = 50  # neutral baseline
+
+        # Setup strength: RSI/Band alignment
+        if setup == "Breakout":
+            smart_score += min((rsi - 50) * 1.2, 25)   # reward strong RSI
+            smart_score += min((band - 0.5) * 50, 15)  # reward high band
+        elif setup == "Pullback":
+            smart_score += min((60 - rsi) * 1.2, 25)   # reward deeper dips
+            smart_score += min((0.5 - band) * 50, 15)  # reward lower band
+
+        # Trend context (Uptrend gets a bonus)
+        if ema20 > ema50:
+            smart_score += 10
+        else:
+            smart_score -= 10
+
+        # If Smart Mode is active and favored sectors exist
+        if st.session_state.get("smart_mode", False):
+            favored = st.session_state.get("favored_sectors", [])
+            ticker_sector = get_tiingo_sector(ticker, TIINGO_TOKEN)
+            if any(s.lower() in ticker_sector.lower() for s in favored):
+                smart_score += 10  # aligned with favored sector
+            else:
+                smart_score -= 5   # not in favored trend
+
+        smart_score = int(np.clip(smart_score, 0, 100))
+        
+                # --- SmartScore Calculation (sector + market bias aware) ---
+        smart_score = 50  # start neutral
+
+        # Base on setup type
+        if setup == "Breakout":
+            smart_score += (rsi - 50) * 0.8 + (band - 0.5) * 40
+        elif setup == "Pullback":
+            smart_score += (60 - rsi) * 0.8 + (0.5 - band) * 40
+        elif near_miss:
+            smart_score += 5  # slight bump if it's a near setup
+
+        # Sector alignment bonus (Smart Mode only)
+        if st.session_state.get("smart_mode", False) and "smart_context" in st.session_state:
+            try:
+                smart_df = st.session_state["smart_context"]["sectors_df"]
+                sector = get_tiingo_sector(ticker, TIINGO_TOKEN)
+                bias = smart_df.loc[smart_df["Sector"] == sector, "Bias"].values[0] if sector in smart_df["Sector"].values else "Neutral"
+
+                if bias == "Uptrend" and setup == "Breakout":
+                    smart_score += 15
+                elif bias == "Downtrend" and setup == "Pullback":
+                    smart_score += 15
+                elif bias == "Sideways":
+                    smart_score -= 5
+            except Exception as e:
+                st.write(f"⚠️ SmartScore sector bias error: {e}")
+
+        # Clamp SmartScore to 0–100 range
+        smart_score = max(0, min(100, round(smart_score, 1)))
 
         # --- Build result card ---
         card = {
             "Symbol": ticker,
             "Price": round(px, 2),
             "Volume": int(vol),
-            "RSI14": round(float(last.get("RSI14", np.nan)), 1),
-            "EMA20>EMA50": bool(last["EMA20"] > last["EMA50"]),
-            "BandPos20": round(float(last.get("BandPos20", np.nan)), 2),
-            "ATR14": round(float(atr), 2),
-            "Setup": setup,
+            "RSI14": round(rsi, 1),
+            "EMA20>EMA50": ema20 > ema50,
+            "BandPos20": round(band, 2),
+            "ATR14": round(atr, 2),
+            "Setup": setup or "NearMiss",
             "Stop": round(stop, 2),
             "Target": round(target, 2),
+            "SmartScore": smart_score,
+            "NearMiss": near_miss,
+            "NearType": near_type,
+            "SetupContext": setup_context,   # ✅ now always included
         }
 
-        st.write(f"✅ {ticker}: built card successfully")
+        # --- Debug (optional, visible in console/UI logs) ---
+        if setup:
+            st.write(f"✅ {ticker}: Confirmed {setup} | Trend={trend_context}")
+        elif near_miss:
+            st.write(f"🟡 {ticker}: Near Miss → {near_type} | Trend={trend_context}")
+        else:
+            st.write(f"⚙️ {ticker}: No match | Trend={trend_context}")
+
         return card
 
     except Exception as e:
         st.write(f"⚠️ {ticker} failed with error: {e}")
         return None
-
 
 
 # ---------------- Scanner (full universe, concurrent) ----------------
@@ -499,7 +719,7 @@ def run_full_scan(mode: str, price_min: float, price_max: float, min_volume: flo
     tickers = tiingo_all_us_tickers(TIINGO_TOKEN)
 
     # Shuffle to diversify early results & keep UI feeling live
-    random.seed()  # or random.seed(time.time())
+    random.seed()
     random.shuffle(tickers)
 
     results: list[dict] = []
@@ -510,29 +730,54 @@ def run_full_scan(mode: str, price_min: float, price_max: float, min_volume: flo
     for i in range(0, total, BATCH_TICKER_COUNT):
         if len(results) >= max_cards:
             break
-        batch = tickers[i:i+BATCH_TICKER_COUNT]
+        batch = tickers[i:i + BATCH_TICKER_COUNT]
         with futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futs = [ex.submit(evaluate_ticker, t, mode, price_min, price_max, min_volume) for t in batch]
             for f in futures.as_completed(futs):
                 rec = f.result()
                 if rec is not None:
                     results.append(rec)
+
         scanned = min(i + len(batch), total)
         progress.progress(scanned / total, text=f"🔎 Scanning… {scanned}/{total} tickers | Hits: {len(results)}")
         time.sleep(REQUEST_PAUSE_S)
 
     progress.empty()
 
-    # Sort and return
+    # --- Smart sorting: favor strong setups and favored sectors ---
     def sort_key(r):
-        if r["Setup"] == "Breakout":
-            return (-1, -r["RSI14"], -r["Volume"])
-        if r["Setup"] == "Pullback":
-            return (0, r["BandPos20"], -r["Volume"])
-        return (1, r["Price"])
+        base_score = 0
+        if r.get("Setup") == "Breakout":
+            base_score = 100 - r.get("RSI14", 0)  # lower RSI = more potential
+        elif r.get("Setup") == "Pullback":
+            base_score = r.get("BandPos20", 0) * 100
+
+        # Boost for favored sectors (Smart Mode)
+        bonus = 0
+        if st.session_state.get("smart_mode", False):
+            smart_context = st.session_state.get("smart_context", {})
+            favored = [s.lower() for s in smart_context.get("favored_sectors", [])]
+            sector = str(r.get("Sector", "Unknown")).lower()
+            if any(s in sector for s in favored):
+                bonus += 15
+
+        return -(base_score + bonus)
+
     results.sort(key=sort_key)
-    st.write(f"✅ Scan complete — {len(results)} matches found out of {len(tickers)} tickers")
-    return results
+
+    # --- Separate confirmed vs near misses ---
+    confirmed = [r for r in results if r.get("Setup") in ["Breakout", "Pullback"]]
+    near_misses = [r for r in results if r.get("NearMiss")]
+
+    st.session_state["scanner_results_confirmed"] = confirmed
+    st.session_state["scanner_results_near"] = near_misses
+    st.session_state["scanner_results"] = confirmed + near_misses   # ✅ add this line!
+
+    st.write(f"🧪 Debug: {len(confirmed)} confirmed | {len(near_misses)} near misses collected")
+
+    return confirmed + near_misses
+
+
 
 
 # ---------------- Helper for Watchlist Screener only ----------------
@@ -607,6 +852,27 @@ with st.sidebar:
 
     min_volume = st.number_input("Min Volume (shares, latest bar)", value=500_000, step=50_000, min_value=0)
     max_cards  = st.slider("Max Cards to Show", min_value=24, max_value=500, value=120, step=12)
+    # ---------------- Smart Mode toggle ----------------
+    smart_mode = st.toggle("🧠 Enable Smart Mode", value=st.session_state.get("smart_mode", False))
+    st.session_state["smart_mode"] = smart_mode
+
+    # Make sure smart_context exists
+    if "smart_context" not in st.session_state:
+        st.session_state["smart_context"] = {}
+
+    # ---------------- Compute favored sectors when Smart Mode is enabled ----------------
+    if st.session_state["smart_mode"]:
+        sector_df = get_sector_snapshot(TIINGO_TOKEN)
+        favored = sector_df.loc[sector_df["Bias"] == "Uptrend", "Sector"].tolist()
+        st.session_state["smart_context"]["favored_sectors"] = favored
+
+        # Display current favored sectors in sidebar
+        if favored:
+            st.success("🌟 Favored sectors: " + ", ".join(favored))
+        else:
+            st.info("🌥️ No favored sectors right now")
+    else:
+        st.session_state["smart_context"]["favored_sectors"] = []
 
     st.markdown("---")
     st.caption("**Trade Plan Defaults** (used for Target/Stop on each card)")
@@ -619,6 +885,17 @@ with st.sidebar:
     run_scan = st.button("🚀 Run Full U.S. Scan", use_container_width=True)
 
 # ---------------- UI: Results Grid ----------------
+if st.session_state.get("smart_mode", False):
+    market = get_market_snapshot(TIINGO_TOKEN)
+    if market:
+        st.markdown(f"""
+        ### 🧭 Market Snapshot
+        **SPY:** ${market['spy_price']} — *{market['bias']}*  
+        Volatility: *{market['vol_regime']}* ({market['atrp']}% ATR)
+        """)
+    else:
+        st.warning("⚠️ Could not load SPY snapshot for market bias.")
+
 st.header("📊 Webull-Style Market Scanner — U.S. (Tiingo)")
 st.caption("All active U.S. equities. Filters: price, volume, and setup mode (Pullback/Breakout/Both). Cards show your Trade Plan target & stop.")
 
@@ -626,7 +903,7 @@ if run_scan:
     st.session_state["scanner_running"] = True
     with st.spinner("Scanning the U.S. market... this may take 1–2 minutes"):
         current_mode = st.session_state.get("setup_mode", "Breakout")
-        st.write(f"🧭 Running full scan mode: {current_mode}")  # optional debug line
+        st.write(f"🧭 Running full scan mode: {current_mode}")
         st.session_state["scanner_results"] = run_full_scan(
             mode=current_mode,
             price_min=price_min,
@@ -636,6 +913,15 @@ if run_scan:
         )
     st.session_state["scanner_running"] = False
 
+    # ---------------- Smart Mode Context (Sector Trend Awareness) ----------------
+    if st.session_state.get("smart_mode", False):
+        try:
+            smart_context = {}
+            smart_context["sectors_df"] = get_sector_snapshot(TIINGO_TOKEN)
+            st.session_state["smart_context"] = smart_context
+            st.caption("🧠 Smart Mode active — sector trends updated.")
+        except Exception as e:
+            st.warning(f"Smart Mode failed: {e}")
 
 # safely retrieve results (don’t reset them on rerun)
 results = st.session_state.get("scanner_results", [])
@@ -643,63 +929,145 @@ results = st.session_state.get("scanner_results", [])
 if not results:
     st.info("Run the full scan to see cards. Use the sidebar to set filters.")
 else:
-    # Compact grid — 4 cards per row
-    per_row = 4
-    rows = math.ceil(len(results) / per_row)
-    for r in range(rows):
-        cols = st.columns(per_row)
-        for j, col in enumerate(cols):
-            idx = r*per_row + j
-            if idx >= len(results): break
-            rec = results[idx]
+    # ✅ Separate Confirmed vs Near Miss tabs
+    confirmed = st.session_state.get("scanner_results_confirmed", [])
+    near_misses = st.session_state.get("scanner_results_near", [])
 
-            # Color accent by setup
-            accent = "border-green-500" if rec["Setup"] == "Breakout" else ("border-blue-500" if rec["Setup"] == "Pullback" else "border-gray-400")
-            # Card body
-            with col:
-                st.markdown(
-                    f"""
-                    <div style="
-                        border:2px solid {'#22c55e' if rec['Setup']=='Breakout' else ('#3b82f6' if rec['Setup']=='Pullback' else '#9ca3af')};
-                        border-radius:14px;padding:10px;">
-                        <div style="display:flex;justify-content:space-between;align-items:baseline;">
-                            <div style="font-weight:700;font-size:1.15rem">{rec['Symbol']}</div>
-                            <div style="font-weight:600">${rec['Price']:.2f}</div>
-                        </div>
-                        <div style="font-size:0.9rem;opacity:0.9;margin-top:4px;">
-                            Setup: <b>{rec['Setup']}</b> &nbsp;|&nbsp; RSI14: <b>{rec['RSI14']}</b> &nbsp;|&nbsp; Vol: <b>{rec['Volume']:,}</b><br/>
-                            EMA20&gt;EMA50: <b>{'✅' if rec['EMA20>EMA50'] else '❌'}</b> &nbsp;|&nbsp; BandPos20: <b>{rec['BandPos20']}</b> &nbsp;|&nbsp; ATR14: <b>{rec['ATR14']}</b>
-                        </div>
-                        <div style="margin-top:6px;font-size:0.95rem;line-height:1.4;">
-                            🛡️ Stop: <b>${rec['Stop']:.2f}</b><br/>
-                            🎯 <b style="color:#16a34a;">Target: ${rec['Target']:.2f}</b>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+    tab_confirmed, tab_near = st.tabs([
+        f"✅ Confirmed Setups ({len(confirmed)})",
+        f"🟡 Near Misses ({len(near_misses)})"
+    ])
 
-                cA, cB = st.columns(2)
-                with cA:
-                    if st.button("➕ Watchlist", key=f"wl_{rec['Symbol']}"):
-                        if rec["Symbol"] not in st.session_state.watchlist:
-                            st.session_state.watchlist.append(rec["Symbol"])
-                            st.success(f"Added {rec['Symbol']} to watchlist.")
-                        else:
-                            st.info(f"{rec['Symbol']} already on watchlist.")
-                with cB:
-                    if st.button("🔍 Send to Analyzer", key=f"scan_an_{rec['Symbol']}"):
-                        # --- Connection bridge between Screener/Watchlist → Analyzer ---
-                        st.session_state["analyze_symbol"] = rec["Symbol"]
-                        st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode", "Both"))
-                        st.session_state["setup_mode"] = rec.get("Setup", "Both")  # keep global consistent
+    # --- Confirmed setups tab ---
+    with tab_confirmed:
+        if confirmed:
+            per_row = 4
+            rows = math.ceil(len(confirmed) / per_row)
+            for r in range(rows):
+                cols = st.columns(per_row)
+                for j, col in enumerate(cols):
+                    idx = r * per_row + j
+                    if idx >= len(confirmed): break
+                    rec = confirmed[idx]
 
-                        # If your app uses multipage navigation:
-                        # st.switch_page("Analyzer")
+                    # --- Smart Badge for Sector Alignment ---
+                    favored_badge = ""
+                    if st.session_state.get("smart_mode", False) and "smart_context" in st.session_state:
+                        df = st.session_state["smart_context"]["sectors_df"]
+                        sector = get_tiingo_sector(rec["Symbol"], TIINGO_TOKEN)
+                        bias = df.loc[df["Sector"] == sector, "Bias"].values[0] if sector in df["Sector"].values else "Unknown"
+                        if bias == "Uptrend" and rec["Setup"] == "Breakout":
+                            favored_badge = "🟢 Sector Uptrend"
+                        elif bias == "Downtrend" and rec["Setup"] == "Pullback":
+                            favored_badge = "🔵 Sector Downtrend"
 
-                        # If you're running everything on one page (tabs or expanders),
-                        # you can just trigger the Analyzer rerun:
-                        st.rerun()
+                    with col:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border:2px solid {'#22c55e' if rec['Setup']=='Breakout' else '#3b82f6'};
+                                border-radius:14px;padding:10px;">
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                                    <div style="font-weight:700;font-size:1.15rem">{rec['Symbol']}</div>
+                                    <div style="font-weight:600">${rec['Price']:.2f}</div>
+                                </div>
+                                <span style="font-size:0.85rem;color:#facc15;">⭐ Smart Score: {rec.get('SmartScore', '—')}</span>
+                                <div style="font-size:0.9rem;opacity:0.9;margin-top:4px;">
+                                    Setup: <b>{rec['Setup']}</b> &nbsp;|&nbsp; RSI14: <b>{rec['RSI14']}</b> &nbsp;|&nbsp; Vol: <b>{rec['Volume']:,}</b><br/>
+                                    EMA20&gt;EMA50: <b>{'✅' if rec['EMA20>EMA50'] else '❌'}</b> &nbsp;|&nbsp; BandPos20: <b>{rec['BandPos20']}</b> &nbsp;|&nbsp; ATR14: <b>{rec['ATR14']}</b>
+                                </div>
+                                <div style="margin-top:6px;font-size:0.95rem;line-height:1.4;">
+                                    🛡️ Stop: <b>${rec['Stop']:.2f}</b><br/>
+                                    🎯 <b style="color:#16a34a;">Target: ${rec['Target']:.2f}</b>
+                                </div>
+                                {f"<div style='margin-top:4px;font-size:0.85rem;opacity:0.85;color:#22c55e;'>{favored_badge}</div>" if favored_badge else ""}
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+
+                        st.markdown(
+                            f"🧭 Context: <b>{rec.get('SetupContext', 'N/A')}</b>",
+                            unsafe_allow_html=True
+                        )
+
+                        cA, cB = st.columns(2)
+                        with cA:
+                            if st.button("➕ Watchlist", key=f"wl_c_{rec['Symbol']}"):
+                                if rec["Symbol"] not in st.session_state.watchlist:
+                                    st.session_state.watchlist.append(rec["Symbol"])
+                                    st.success(f"Added {rec['Symbol']} to watchlist.")
+                                else:
+                                    st.info(f"{rec['Symbol']} already on watchlist.")
+                        with cB:
+                            if st.button("🔍 Send to Analyzer", key=f"scan_an_c_{rec['Symbol']}"):
+                                st.session_state["analyze_symbol"] = rec["Symbol"]
+                                st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode", "Both"))
+                                st.session_state["setup_mode"] = rec.get("Setup", "Both")
+                                st.rerun()
+        else:
+            st.info("No confirmed setups found in this scan.")
+
+    # --- Near Misses tab ---
+    with tab_near:
+        if near_misses:
+            per_row = 4
+            rows = math.ceil(len(near_misses) / per_row)
+            for r in range(rows):
+                cols = st.columns(per_row)
+                for j, col in enumerate(cols):
+                    idx = r * per_row + j
+                    if idx >= len(near_misses): break
+                    rec = near_misses[idx]
+                    with col:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border:2px dashed #facc15;
+                                border-radius:14px;padding:10px;">
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                                    <div style="font-weight:700;font-size:1.15rem">{rec['Symbol']}</div>
+                                    <div style="font-weight:600">${rec['Price']:.2f}</div>
+                                </div>
+                                <span style="font-size:0.85rem;color:#facc15;">⭐ Smart Score: {rec.get('SmartScore', '—')}</span>
+                                <div style="font-size:0.9rem;opacity:0.9;margin-top:4px;">
+                                    🟡 Potential <b>{rec['NearMiss']}</b> setup forming<br/>
+                                    RSI14: <b>{rec['RSI14']}</b> | BandPos20: <b>{rec['BandPos20']}</b>
+                                </div>
+                                <div style="margin-top:6px;font-size:0.95rem;line-height:1.4;">
+                                    🛡️ Stop: <b>${rec['Stop']:.2f}</b><br/>
+                                    🎯 <b style="color:#16a34a;">Target: ${rec['Target']:.2f}</b>
+                                </div>
+                                {f"<div style='margin-top:4px;font-size:0.85rem;opacity:0.85;color:#22c55e;'>{favored_badge}</div>" if favored_badge else ""}
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+
+                        st.markdown(
+                            f"<div style='font-size:0.85rem;opacity:0.75;margin-top:-4px;'>🧭 Context: <b>{rec.get('SetupContext', 'N/A')}</b></div>",
+                            unsafe_allow_html=True
+                        )
+
+
+                        cA, cB = st.columns(2)
+                        with cA:
+                            if st.button("➕ Watchlist", key=f"wl_n_{rec['Symbol']}"):
+                                if rec["Symbol"] not in st.session_state.watchlist:
+                                    st.session_state.watchlist.append(rec["Symbol"])
+                                    st.success(f"Added {rec['Symbol']} to watchlist.")
+                                else:
+                                    st.info(f"{rec['Symbol']} already on watchlist.")
+                        with cB:
+                            if st.button("🔍 Send to Analyzer", key=f"scan_an_n_{rec['Symbol']}"):
+                                st.session_state["analyze_symbol"] = rec["Symbol"]
+                                st.session_state["sent_setup"] = rec.get("Setup", st.session_state.get("setup_mode","Both"))
+                                st.session_state["setup_mode"] = rec.get("Setup","Both")
+                                st.rerun()
+        else:
+            st.info("No near misses detected in this scan.")
+
+
 
 
 # ---------------- Watchlist Screener Results (Main Page) ----------------
